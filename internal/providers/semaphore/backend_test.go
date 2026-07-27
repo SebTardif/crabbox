@@ -571,7 +571,7 @@ func TestResolveProjectIDRejectsUserinfoPaginationLink(t *testing.T) {
 	// Relative Link targets of the form `@attacker/...` used to be concatenated as
 	// `https://<configured-host>@attacker/...`, turning the configured host into
 	// URL userinfo and sending Authorization to an unrelated hostname.
-	const token = "sem-secret-token"
+	const token = "test-authorization-marker"
 	var seen []string
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		seen = append(seen, r.Host+"|"+r.URL.RequestURI()+"|"+r.Header.Get("Authorization"))
@@ -647,7 +647,7 @@ func TestResolvePaginationRefRejectsCrossOriginAndUserinfo(t *testing.T) {
 	// Resolved against the base it becomes a path on the configured host; apiURL
 	// then keeps it same-origin. Ensure the dangerous concat form is not used by
 	// checking apiURL rejects explicit userinfo.
-	if _, err := client.apiURL("https://user:pass@evil.example/api"); err == nil ||
+	if _, err := client.apiURL("https://example-user@outside.invalid/api"); err == nil ||
 		!strings.Contains(err.Error(), "userinfo") && !strings.Contains(err.Error(), "outside") {
 		t.Fatalf("userinfo URL err=%v", err)
 	}
