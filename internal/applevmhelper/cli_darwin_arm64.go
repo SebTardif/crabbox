@@ -26,19 +26,20 @@ import (
 )
 
 var (
-	prepareInstanceAssetsFunc  = prepareInstanceAssets
-	helperExecutable           = os.Executable
-	processStartTime           = readProcessStartTime
-	processArguments           = readProcessArguments
-	processAlive               = pidAlive
-	signalProcess              = sendProcessSignal
-	writeMetadataFunc          = writeMetadata
-	runStartReadyTimeout       = 45 * time.Second
-	runStartPollInterval       = 250 * time.Millisecond
-	terminateInstanceGraceTime = 20 * time.Second
-	terminateInstancePollTime  = 250 * time.Millisecond
-	pidlessStartupStaleAfter   = 2 * time.Minute
-	metadataLessStaleAfter     = 6 * time.Hour
+	prepareInstanceAssetsFunc    = prepareInstanceAssets
+	helperExecutable             = os.Executable
+	processStartTime             = readProcessStartTime
+	processArguments             = readProcessArguments
+	processAlive                 = pidAlive
+	signalProcess                = sendProcessSignal
+	writeMetadataFunc            = writeMetadata
+	runStartReadyTimeout         = 45 * time.Second
+	runStartPollInterval         = 250 * time.Millisecond
+	runStartCancelCleanupTimeout = 5 * time.Second
+	terminateInstanceGraceTime   = 20 * time.Second
+	terminateInstancePollTime    = 250 * time.Millisecond
+	pidlessStartupStaleAfter     = 2 * time.Minute
+	metadataLessStaleAfter       = 6 * time.Hour
 )
 
 // sleepPoll waits for delay or returns early when ctx is cancelled.
@@ -348,7 +349,7 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 			)
 			return failure
 		case <-ctx.Done():
-			return errors.Join(ctx.Err(), cleanupStartedHelper(context.Background(), inst, instanceRoot))
+			return errors.Join(ctx.Err(), cleanupCanceledStart(inst, instanceRoot))
 		case <-pollTicker.C:
 		}
 	}
@@ -477,6 +478,12 @@ func cleanupStartedHelper(ctx context.Context, inst Instance, instanceRoot strin
 	return nil
 }
 
+func cleanupCanceledStart(inst Instance, instanceRoot string) error {
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), runStartCancelCleanupTimeout)
+	defer cancel()
+	return cleanupStartedHelper(cleanupCtx, inst, instanceRoot)
+}
+
 func cleanupUnauthorizedStartedHelper(inst Instance, instanceRoot string, waitCh <-chan error) error {
 	timer := time.NewTimer(terminateInstanceGraceTime)
 	defer timer.Stop()
@@ -509,7 +516,7 @@ func terminateStartedHelper(ctx context.Context, inst Instance) error {
 			return err
 		}
 		if err := sleepPoll(ctx, terminateInstancePollTime); err != nil {
-			return err
+			break
 		}
 	}
 	matches, err = startedHelperIdentityMatches(inst)
@@ -526,7 +533,7 @@ func terminateStartedHelper(ctx context.Context, inst Instance) error {
 			return err
 		}
 		if err := sleepPoll(ctx, terminateInstancePollTime); err != nil {
-			return err
+			return errors.Join(err, fmt.Errorf("helper process %d remained alive after SIGKILL", inst.PID))
 		}
 	}
 	return fmt.Errorf("helper process %d remained alive after SIGKILL", inst.PID)

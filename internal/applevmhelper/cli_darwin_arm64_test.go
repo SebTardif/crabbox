@@ -1127,7 +1127,11 @@ func TestTerminateStartedHelperHonorsCancellationDuringPoll(t *testing.T) {
 
 	processAlive = func(int) bool { return true }
 	processStartTime = func(int) (string, error) { return "original-start", nil }
-	signalProcess = func(int, os.Signal) error { return nil }
+	var signals []os.Signal
+	signalProcess = func(_ int, signal os.Signal) error {
+		signals = append(signals, signal)
+		return nil
+	}
 	terminateInstanceGraceTime = time.Hour
 	terminateInstancePollTime = time.Hour
 
@@ -1145,5 +1149,57 @@ func TestTerminateStartedHelperHonorsCancellationDuringPoll(t *testing.T) {
 	}
 	if time.Since(start) > 2*time.Second {
 		t.Fatalf("terminateStartedHelper took %v; expected cancel during poll", time.Since(start))
+	}
+	if !slices.Equal(signals, []os.Signal{syscall.SIGTERM, syscall.SIGKILL}) {
+		t.Fatalf("signals=%v, want SIGTERM followed by SIGKILL", signals)
+	}
+}
+
+func TestCleanupCanceledStartOwnsBoundedTermination(t *testing.T) {
+	root := t.TempDir()
+	name := "cancelled-start"
+	instanceRoot := InstanceDir(root, name)
+	mustCreateInstanceDir(t, root, name)
+
+	originalProcessStartTime := processStartTime
+	originalProcessAlive := processAlive
+	originalSignalProcess := signalProcess
+	originalCleanupTimeout := runStartCancelCleanupTimeout
+	originalPollTime := terminateInstancePollTime
+	t.Cleanup(func() {
+		processStartTime = originalProcessStartTime
+		processAlive = originalProcessAlive
+		signalProcess = originalSignalProcess
+		runStartCancelCleanupTimeout = originalCleanupTimeout
+		terminateInstancePollTime = originalPollTime
+	})
+
+	alive := true
+	processAlive = func(int) bool { return alive }
+	processStartTime = func(int) (string, error) { return "original-start", nil }
+	var signals []os.Signal
+	signalProcess = func(_ int, signal os.Signal) error {
+		signals = append(signals, signal)
+		if signal == syscall.SIGKILL {
+			alive = false
+		}
+		return nil
+	}
+	runStartCancelCleanupTimeout = 20 * time.Millisecond
+	terminateInstancePollTime = time.Hour
+
+	start := time.Now()
+	err := cleanupCanceledStart(Instance{PID: 4242, PIDStartedAt: "original-start"}, instanceRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if time.Since(start) > time.Second {
+		t.Fatalf("cleanup took %v; expected bounded cancellation cleanup", time.Since(start))
+	}
+	if !slices.Equal(signals, []os.Signal{syscall.SIGTERM, syscall.SIGKILL}) {
+		t.Fatalf("signals=%v, want SIGTERM followed by SIGKILL", signals)
+	}
+	if _, err := os.Stat(instanceRoot); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("instance state remains after confirmed termination: %v", err)
 	}
 }
