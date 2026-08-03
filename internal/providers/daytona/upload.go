@@ -10,6 +10,7 @@ import (
 	"os"
 	"path"
 	"strings"
+	"time"
 
 	apidaytona "github.com/daytonaio/daytona/libs/api-client-go"
 	sdkdaytona "github.com/daytonaio/daytona/libs/sdk-go/pkg/daytona"
@@ -34,7 +35,7 @@ func (b *daytonaLeaseBackend) uploadDaytonaArchive(ctx context.Context, sandboxI
 	}
 	httpClient := b.rt.HTTP
 	if httpClient == nil {
-		httpClient = http.DefaultClient
+		httpClient = &http.Client{Timeout: 60 * time.Second}
 	}
 	return uploadDaytonaFileStream(ctx, httpClient, endpoint, headers, archive, path.Base(archivePath))
 }
@@ -73,7 +74,7 @@ func daytonaToolboxHeaders(cfg Config) (map[string]string, error) {
 
 func uploadDaytonaFileStream(ctx context.Context, client *http.Client, endpoint string, headers map[string]string, file io.Reader, filename string) error {
 	if client == nil {
-		client = http.DefaultClient
+		client = &http.Client{Timeout: 60 * time.Second}
 	}
 	pr, pw := io.Pipe()
 	writer := multipart.NewWriter(pw)
