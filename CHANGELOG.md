@@ -2,10 +2,6 @@
 
 ## Unreleased
 
-### Fixed
-
-- Replace unbounded `http.DefaultClient` fallbacks with a 60-second timeout client across providers and CLI helpers, matching DigitalOcean/OVH/Linode defaults.
-
 ### Added
 
 - Added a protected broker soak workflow that records sanitized AWS/Azure
