@@ -467,6 +467,73 @@ func TestNormalizeTargetConfigForcesAWSMacOSLaunchdSSHPort(t *testing.T) {
 	}
 }
 
+func TestNormalizeTargetConfigStaticMacOSWorkRootFollowsStaticUser(t *testing.T) {
+	// Regression for openclaw/crabbox#1302: ssh/static macOS defaults used a
+	// hardcoded /Users/ec2-user/crabbox work root even when -static-user set a
+	// different account, so sync mkdir failed on real hosts.
+	cfg := baseConfig()
+	cfg.Provider = staticProvider
+	cfg.TargetOS = targetMacOS
+	cfg.Static.User = "alice"
+	cfg.WorkRoot = ""
+
+	normalizeTargetConfig(&cfg)
+
+	wantRoot := "/Users/alice/crabbox"
+	if cfg.SSHUser != "alice" {
+		t.Fatalf("SSHUser=%q want alice", cfg.SSHUser)
+	}
+	if cfg.WorkRoot != wantRoot {
+		t.Fatalf("WorkRoot=%q want %q", cfg.WorkRoot, wantRoot)
+	}
+}
+
+func TestNormalizeTargetConfigStaticMacOSWorkRootKeepsExplicitStaticWorkRoot(t *testing.T) {
+	cfg := baseConfig()
+	cfg.Provider = staticProvider
+	cfg.TargetOS = targetMacOS
+	cfg.Static.User = "alice"
+	cfg.Static.WorkRoot = "/Users/alice/custom-runs"
+	cfg.WorkRoot = ""
+
+	normalizeTargetConfig(&cfg)
+
+	if cfg.WorkRoot != "/Users/alice/custom-runs" {
+		t.Fatalf("WorkRoot=%q want explicit static work root", cfg.WorkRoot)
+	}
+}
+
+func TestNormalizeTargetConfigAWSMacOSWorkRootStaysEc2UserDefault(t *testing.T) {
+	cfg := baseConfig()
+	cfg.Provider = "aws"
+	cfg.TargetOS = targetMacOS
+	cfg.WorkRoot = ""
+
+	normalizeTargetConfig(&cfg)
+
+	if cfg.SSHUser != "ec2-user" {
+		t.Fatalf("SSHUser=%q want ec2-user", cfg.SSHUser)
+	}
+	if cfg.WorkRoot != defaultMacOSWorkRoot {
+		t.Fatalf("WorkRoot=%q want %q", cfg.WorkRoot, defaultMacOSWorkRoot)
+	}
+}
+
+func TestIsDefaultWorkRootRecognizesUserSpecificMacOSDefaults(t *testing.T) {
+	if !isDefaultWorkRoot("/Users/builder/crabbox") {
+		t.Fatal("expected /Users/builder/crabbox to count as a default macOS work root")
+	}
+	if !isDefaultWorkRoot(defaultMacOSWorkRoot) {
+		t.Fatal("expected legacy ec2-user default to remain a default work root")
+	}
+	if isDefaultWorkRoot("/Users/builder/custom") {
+		t.Fatal("non-crabbox user path must not count as a default")
+	}
+	if isDefaultWorkRoot("/Users/alice/nested/crabbox") {
+		t.Fatal("multi-segment user path must not count as a default")
+	}
+}
+
 func TestNormalizeTargetConfigUsesSealosWorkRoot(t *testing.T) {
 	cfg := baseConfig()
 	cfg.Provider = "sealos-devbox"

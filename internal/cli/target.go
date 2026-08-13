@@ -51,7 +51,10 @@ func normalizeTargetConfig(cfg *Config) {
 		}
 	}
 	if shouldDeriveTargetWorkRoot(cfg) {
-		cfg.WorkRoot = defaultWorkRootForTarget(cfg.TargetOS, cfg.WindowsMode)
+		// Derive after static/aws user defaults so macOS work roots follow
+		// the effective SSH user (e.g. -static-user), not a hardcoded
+		// ec2-user path that may not exist on the host.
+		cfg.WorkRoot = defaultWorkRootForTarget(cfg.TargetOS, cfg.WindowsMode, cfg.SSHUser)
 	}
 	if isStaticProvider(cfg.Provider) {
 		if cfg.Static.Port != "" && cfg.SSHPort == baseConfig().SSHPort {
@@ -85,11 +88,13 @@ func shouldDeriveTargetWorkRoot(cfg *Config) bool {
 }
 
 func isDefaultWorkRoot(value string) bool {
+	value = strings.TrimSpace(value)
 	switch value {
-	case "", defaultPOSIXWorkRoot, defaultMacOSWorkRoot, defaultWindowsWorkRoot:
+	case "", defaultPOSIXWorkRoot, defaultWindowsWorkRoot:
 		return true
 	default:
-		return false
+		// macOS defaults are user-specific (/Users/<user>/crabbox).
+		return isDefaultMacOSWorkRoot(value)
 	}
 }
 
@@ -97,9 +102,34 @@ func IsDefaultWorkRoot(value string) bool {
 	return isDefaultWorkRoot(value)
 }
 
-func defaultWorkRootForTarget(targetOS, windowsMode string) string {
+// isDefaultMacOSWorkRoot reports whether value is a platform-default macOS
+// work root of the form /Users/<single-segment-user>/crabbox.
+func isDefaultMacOSWorkRoot(value string) bool {
+	const prefix = "/Users/"
+	const suffix = "/crabbox"
+	if !strings.HasPrefix(value, prefix) || !strings.HasSuffix(value, suffix) {
+		return false
+	}
+	user := strings.TrimSuffix(strings.TrimPrefix(value, prefix), suffix)
+	return user != "" && user != "." && user != ".." && !strings.Contains(user, "/")
+}
+
+func defaultMacOSWorkRootForUser(sshUser string) string {
+	user := strings.TrimSpace(sshUser)
+	if user == "" {
+		user = "ec2-user"
+	}
+	// path.Base collapses odd input (slashes, trailing segments) to one name.
+	user = path.Base(user)
+	if user == "." || user == ".." || user == string(os.PathSeparator) {
+		user = "ec2-user"
+	}
+	return "/Users/" + user + "/crabbox"
+}
+
+func defaultWorkRootForTarget(targetOS, windowsMode, sshUser string) string {
 	if targetOS == targetMacOS {
-		return defaultMacOSWorkRoot
+		return defaultMacOSWorkRootForUser(sshUser)
 	}
 	if targetOS == targetWindows && windowsMode == windowsModeNormal {
 		return defaultWindowsWorkRoot
