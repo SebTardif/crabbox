@@ -5,13 +5,17 @@ import (
 	"crypto/md5"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/json"
+	"errors"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
@@ -38,6 +42,345 @@ func TestValidateAWSCleanupKeyPair(t *testing.T) {
 	_, err := validateAWSCleanupKeyPair(name, []types.KeyPairInfo{unowned})
 	if err == nil || !IsAWSCleanupKeyOwnershipError(err) {
 		t.Fatalf("unowned key error=%v", err)
+	}
+}
+
+func TestAWSFixedAttemptIdentityIsStableAndScopedToResolvedLaunch(t *testing.T) {
+	cfg := baseConfig()
+	cfg.Provider = "aws"
+	cfg.AWSRegion = "us-east-1"
+	cfg.ServerType = "m7i.large"
+	cfg.Capacity.Market = "on-demand"
+	cfg.Capacity.AvailabilityZones = []string{"us-east-1a"}
+	first := awsFixedAttemptClientToken("cbx_abcdef123456", cfg, "ami-fixed", "sg-fixed", false)
+	second := awsFixedAttemptClientToken("cbx_abcdef123456", cfg, "ami-fixed", "sg-fixed", false)
+	if first != second || len(first) != 64 {
+		t.Fatalf("tokens first=%q second=%q", first, second)
+	}
+	drifted := cfg
+	drifted.ServerType = "m7i.xlarge"
+	if got := awsFixedAttemptClientToken("cbx_abcdef123456", drifted, "ami-fixed", "sg-fixed", false); got == first {
+		t.Fatal("server type drift did not change the fixed attempt token")
+	}
+
+	createdAt := time.Date(2026, 8, 9, 12, 0, 0, 0, time.UTC)
+	left := directLeaseLabels(cfg, "cbx_abcdef123456", "fixed", "aws", "on-demand", true, createdAt)
+	right := directLeaseLabels(cfg, "cbx_abcdef123456", "fixed", "aws", "on-demand", true, createdAt)
+	leftData, err := json.Marshal(left)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rightData, err := json.Marshal(right)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(leftData) != string(rightData) {
+		t.Fatalf("fixed create labels drifted:\n%s\n%s", leftData, rightData)
+	}
+}
+
+func TestAWSFixedAttemptAttestationIsNonCircularAndSecretFree(t *testing.T) {
+	attempt := AWSLaunchAttempt{
+		Region: "us-east-1", AvailabilityZone: "us-east-1a", SubnetID: "subnet-fixed",
+		ServerType: "m7i.large", Market: "on-demand", ImageID: "ami-fixed",
+		SecurityGroupID: "sg-fixed", HostID: "h-fixed", KeyPairID: "key-fixed",
+		ClientToken: "cbx-client-token", ParametersSHA256: strings.Repeat("a", 64),
+	}
+	first := AWSFixedAttemptAttestationLabels(attempt)
+	withDifferentParameters := attempt
+	withDifferentParameters.ParametersSHA256 = strings.Repeat("b", 64)
+	if second := AWSFixedAttemptAttestationLabels(withDifferentParameters); !maps.Equal(first, second) {
+		t.Fatalf("parameters hash changed pre-submit attestation: first=%v second=%v", first, second)
+	}
+	withDifferentImage := attempt
+	withDifferentImage.ImageID = "ami-other"
+	if second := AWSFixedAttemptAttestationLabels(withDifferentImage); maps.Equal(first, second) {
+		t.Fatal("launch tuple drift did not change attempt attestation")
+	}
+	for key, value := range first {
+		if strings.Contains(key, "client") && value == attempt.ClientToken {
+			t.Fatalf("attempt tag %s persisted raw client token", key)
+		}
+	}
+}
+
+func TestAWSMarketFallbackError(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "spot capacity", err: errors.New("UnfulfillableCapacity: no Spot capacity"), want: true},
+		{name: "spot quota", err: errors.New("MaxSpotInstanceCountExceeded: quota"), want: true},
+		{name: "spot unsupported", err: errors.New("UnsupportedOperation: Spot is not supported"), want: true},
+		{name: "parameter independent", err: errors.New("InvalidParameterValue: invalid subnet"), want: false},
+		{name: "unsupported independent", err: errors.New("UnsupportedOperation: architecture is not supported"), want: false},
+		{name: "image independent", err: errors.New("no AWS AMI found in eu-west-1"), want: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := isAWSMarketFallbackError(test.err); got != test.want {
+				t.Fatalf("isAWSMarketFallbackError(%q) = %v, want %v", test.err, got, test.want)
+			}
+		})
+	}
+	if !isRetryableAWSProvisioningError(errors.New("UnfulfillableCapacity: no Spot capacity")) {
+		t.Fatal("UnfulfillableCapacity must remain eligible for type and market fallback")
+	}
+	var candidates []string
+	candidates = appendAWSMarketFallbackCandidate(candidates, "t3.small", errors.New("InvalidParameterValue: invalid subnet"))
+	candidates = appendAWSMarketFallbackCandidate(candidates, "t3.medium", errors.New("UnfulfillableCapacity: no Spot capacity"))
+	if len(candidates) != 1 || candidates[0] != "t3.medium" {
+		t.Fatalf("mixed market fallback candidates = %v, want [t3.medium]", candidates)
+	}
+}
+
+func TestAWSFixedPinnedAttemptBlocksBroadRegionFallback(t *testing.T) {
+	control := &AWSFixedCreateControl{PinnedAttempt: &AWSLaunchAttempt{ClientToken: "pinned"}}
+	err := errors.New("transport closed while waiting for capacity response")
+	if !isRetryableAWSRegionProvisioningError(err) {
+		t.Fatal("test error must exercise the broad region retry classifier")
+	}
+	if isRetryableAWSProvisioningError(err) {
+		t.Fatal("test error must remain ambiguous at the RunInstances classifier")
+	}
+	if shouldRetryAWSRegionAfterCreateError(err, control) {
+		t.Fatal("ambiguous fixed attempt advanced to another region")
+	}
+}
+
+func TestAWSFixedPinnedAttemptNeverResubmitsRunInstances(t *testing.T) {
+	publicKey := testOpenSSHPublicKey("ssh-ed25519", testBytes(32, 9))
+	var requests []string
+	var pinned AWSLaunchAttempt
+	persisted := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		params, err := url.ParseQuery(string(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if params.Get("Action") != "RunInstances" {
+			t.Fatalf("action=%q", params.Get("Action"))
+		}
+		if !persisted {
+			t.Fatal("RunInstances reached the provider before the attempt was persisted")
+		}
+		assertAWSFixedAttemptRequestTags(t, params, pinned)
+		requests = append(requests, params.Encode())
+		writeEC2XML(w, `<RunInstancesResponse><instancesSet><item><instanceId>i-fixed</instanceId><instanceType>m7i.large</instanceType><ipAddress>203.0.113.44</ipAddress><instanceState><name>pending</name></instanceState></item></instancesSet></RunInstancesResponse>`)
+	}))
+	defer server.Close()
+
+	cfg := baseConfig()
+	cfg.Provider = "aws"
+	cfg.TargetOS = targetLinux
+	cfg.AWSRegion = "eu-west-1"
+	cfg.ServerType = "m7i.large"
+	cfg.ProviderKey = "crabbox-cbx-abcdef123456"
+	cfg.Capacity.Market = "on-demand"
+	createdAt := time.Date(2026, 8, 9, 12, 0, 0, 123, time.UTC)
+	control := &AWSFixedCreateControl{
+		CreatedAt: createdAt, IntentFingerprint: strings.Repeat("b", 64),
+		AccountID: "123456789012", KeyPairID: "key-fixed", FailedTokens: map[string]bool{},
+	}
+	control.BeforeAttempt = func(attempt AWSLaunchAttempt) error {
+		pinned = attempt
+		persisted = true
+		return nil
+	}
+	client := testAWSClient(server.URL)
+	if _, err := client.createServer(context.Background(), cfg, publicKey, "cbx_abcdef123456", "fixed", true, "ami-fixed", "sg-fixed", false, control); err != nil {
+		t.Fatal(err)
+	}
+
+	persisted = true
+	replay := &AWSFixedCreateControl{
+		CreatedAt: createdAt, IntentFingerprint: strings.Repeat("b", 64),
+		AccountID: "123456789012", KeyPairID: "key-fixed", PinnedAttempt: &pinned,
+		FailedTokens: map[string]bool{},
+	}
+	if _, err := client.createServer(context.Background(), cfg, publicKey, "cbx_abcdef123456", "fixed", true, "ami-fixed", "sg-fixed", false, replay); err == nil || !strings.Contains(err.Error(), "lease_id_conflict") {
+		t.Fatalf("pinned replay err=%v", err)
+	}
+	if len(requests) != 1 {
+		t.Fatalf("pinned replay reached RunInstances: requests=%d", len(requests))
+	}
+}
+
+func TestAWSFixedTerminalRunInstancesRejectionCleansKeyBeforeClearingAttempt(t *testing.T) {
+	publicKey := testOpenSSHPublicKey("ssh-ed25519", testBytes(32, 11))
+	const keyPairID = "key-terminal-rejection"
+	var actions []string
+	deleteDenied := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		params, err := url.ParseQuery(string(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		action := params.Get("Action")
+		actions = append(actions, action)
+		switch action {
+		case "DescribeKeyPairs":
+			writeEC2Error(w, "InvalidKeyPair.NotFound", "missing", http.StatusBadRequest)
+		case "ImportKeyPair":
+			writeEC2XML(w, `<ImportKeyPairResponse><keyName>crabbox-test</keyName><keyPairId>`+keyPairID+`</keyPairId></ImportKeyPairResponse>`)
+		case "DescribeSecurityGroups":
+			writeEC2XML(w, `<DescribeSecurityGroupsResponse><securityGroupInfo><item><groupId>sg-fixed</groupId></item></securityGroupInfo></DescribeSecurityGroupsResponse>`)
+		case "AuthorizeSecurityGroupIngress":
+			writeEC2XML(w, `<AuthorizeSecurityGroupIngressResponse />`)
+		case "RunInstances":
+			writeEC2Error(w, "Blocked", "encoded authorization detail must not escape", http.StatusBadRequest)
+		case "DeleteKeyPair":
+			if got := params.Get("KeyPairId"); got != keyPairID {
+				t.Fatalf("KeyPairId=%q, want %q", got, keyPairID)
+			}
+			if deleteDenied {
+				writeEC2Error(w, "UnauthorizedOperation", "encoded cleanup authorization detail must not escape", http.StatusForbidden)
+				return
+			}
+			writeEC2XML(w, `<DeleteKeyPairResponse><return>true</return></DeleteKeyPairResponse>`)
+		default:
+			writeEC2Error(w, "Unexpected", action, http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+
+	persisted := false
+	cleared := false
+	newControl := func() *AWSFixedCreateControl {
+		control := &AWSFixedCreateControl{
+			CreatedAt: time.Now().UTC(), IntentFingerprint: strings.Repeat("b", 64),
+			AccountID: "123456789012", FailedTokens: map[string]bool{},
+		}
+		control.BeforeAttempt = func(AWSLaunchAttempt) error {
+			persisted = true
+			return nil
+		}
+		control.DefiniteFailure = func(AWSLaunchAttempt) error {
+			if got := actions[len(actions)-1]; got != "DeleteKeyPair" {
+				t.Fatalf("attempt cleared before support-resource cleanup: last action=%s", got)
+			}
+			cleared = true
+			return nil
+		}
+		return control
+	}
+	control := newControl()
+	cfg := baseConfig()
+	cfg.Provider = "aws"
+	cfg.ProviderKey = "crabbox-test"
+	cfg.AWSAMI = "ami-fixed"
+	cfg.AWSSGID = "sg-fixed"
+	cfg.ServerType = "t3.medium"
+	cfg.ServerTypeExplicit = true
+	cfg.Capacity.Market = "on-demand"
+	cfg.SSHPort = "22"
+	cfg.SSHFallbackPorts = nil
+
+	_, _, err := testAWSClient(server.URL).createServerWithFallbackInRegion(
+		context.Background(), cfg, publicKey, "cbx_abcdef123456", "fixed", true, nil, control,
+	)
+	if err == nil || !strings.Contains(err.Error(), "AWS RunInstances rejected request (Blocked)") {
+		t.Fatalf("err=%v, want sanitized terminal rejection", err)
+	}
+	if strings.Contains(err.Error(), "encoded authorization detail") {
+		t.Fatalf("terminal rejection leaked provider detail: %v", err)
+	}
+	if !persisted || !cleared || control.PinnedAttempt != nil {
+		t.Fatalf("persisted=%t cleared=%t pinned=%#v", persisted, cleared, control.PinnedAttempt)
+	}
+	wantActions := []string{"DescribeKeyPairs", "ImportKeyPair", "DescribeSecurityGroups", "AuthorizeSecurityGroupIngress", "RunInstances", "DeleteKeyPair"}
+	if !slices.Equal(actions, wantActions) {
+		t.Fatalf("actions=%v, want %v", actions, wantActions)
+	}
+
+	actions = nil
+	persisted = false
+	cleared = false
+	deleteDenied = true
+	control = newControl()
+	_, _, err = testAWSClient(server.URL).createServerWithFallbackInRegion(
+		context.Background(), cfg, publicKey, "cbx_abcdef123457", "fixed", true, nil, control,
+	)
+	if err == nil || !strings.Contains(err.Error(), "AWS DeleteKeyPair rejected request (UnauthorizedOperation)") {
+		t.Fatalf("cleanup err=%v, want sanitized DeleteKeyPair rejection", err)
+	}
+	if strings.Contains(err.Error(), "encoded cleanup authorization detail") {
+		t.Fatalf("cleanup rejection leaked provider detail: %v", err)
+	}
+	if !persisted || cleared || control.PinnedAttempt == nil {
+		t.Fatalf("cleanup failure persisted=%t cleared=%t pinned=%#v", persisted, cleared, control.PinnedAttempt)
+	}
+	if !slices.Equal(actions, wantActions) {
+		t.Fatalf("cleanup failure actions=%v, want %v", actions, wantActions)
+	}
+}
+
+func TestAWSOrdinaryRunInstancesOmitsFixedAttemptTags(t *testing.T) {
+	publicKey := testOpenSSHPublicKey("ssh-ed25519", testBytes(32, 10))
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		params, err := url.ParseQuery(string(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for name := range params {
+			if !strings.HasSuffix(name, ".Key") {
+				continue
+			}
+			if tag := params.Get(name); strings.HasPrefix(tag, "fixed_attempt_") {
+				t.Fatalf("ordinary RunInstances included fixed attempt tag %q", tag)
+			}
+		}
+		writeEC2XML(w, `<RunInstancesResponse><instancesSet><item><instanceId>i-ordinary</instanceId><instanceType>m7i.large</instanceType><ipAddress>203.0.113.45</ipAddress><instanceState><name>pending</name></instanceState></item></instancesSet></RunInstancesResponse>`)
+	}))
+	defer server.Close()
+
+	cfg := baseConfig()
+	cfg.Provider = "aws"
+	cfg.TargetOS = targetLinux
+	cfg.AWSRegion = "eu-west-1"
+	cfg.ServerType = "m7i.large"
+	cfg.ProviderKey = "crabbox-cbx-abcdef123483"
+	cfg.Capacity.Market = "on-demand"
+	client := testAWSClient(server.URL)
+	if _, err := client.createServer(context.Background(), cfg, publicKey, "cbx_abcdef123483", "ordinary", true, "ami-ordinary", "sg-ordinary", false, nil); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func assertAWSFixedAttemptRequestTags(t *testing.T, params url.Values, attempt AWSLaunchAttempt) {
+	t.Helper()
+	expected := AWSFixedAttemptAttestationLabels(attempt)
+	found := map[string]string{}
+	for name := range params {
+		if !strings.HasSuffix(name, ".Key") {
+			continue
+		}
+		tag := params.Get(name)
+		if _, ok := expected[tag]; !ok {
+			continue
+		}
+		value := params.Get(strings.TrimSuffix(name, ".Key") + ".Value")
+		found[tag] = value
+	}
+	for key, value := range expected {
+		if actual, ok := found[key]; !ok {
+			t.Errorf("RunInstances missing fixed attempt tag %s", key)
+		} else if actual != value {
+			t.Errorf("RunInstances fixed attempt tag %s=%q, want %q", key, actual, value)
+		}
 	}
 }
 
@@ -163,7 +506,7 @@ func TestAWSCreateRollbackDeletesOnlyNewImmutableKeyID(t *testing.T) {
 	defer server.Close()
 
 	cfg := Config{Provider: "aws", ProviderKey: "crabbox-test", AWSAMI: "ami-test", AWSSGID: "sg-test"}
-	_, _, err := testAWSClient(server.URL).createServerWithFallbackInRegion(context.Background(), cfg, publicKey, "cbx_123", "rollback", false, nil)
+	_, _, err := testAWSClient(server.URL).createServerWithFallbackInRegion(context.Background(), cfg, publicKey, "cbx_123", "rollback", false, nil, nil)
 	if err == nil {
 		t.Fatal("expected create failure")
 	}
@@ -200,7 +543,7 @@ func TestAWSCreateRollbackPreservesMatchingUnmanagedKey(t *testing.T) {
 	defer server.Close()
 
 	cfg := Config{Provider: "aws", ProviderKey: "crabbox-test", AWSAMI: "ami-test", AWSSGID: "sg-test"}
-	_, _, err := testAWSClient(server.URL).createServerWithFallbackInRegion(context.Background(), cfg, publicKey, "cbx_123", "rollback", false, nil)
+	_, _, err := testAWSClient(server.URL).createServerWithFallbackInRegion(context.Background(), cfg, publicKey, "cbx_123", "rollback", false, nil, nil)
 	if err == nil {
 		t.Fatal("expected create failure")
 	}
@@ -847,7 +1190,7 @@ func TestAWSMacOSFallbackResolvesAMIForEachInstanceType(t *testing.T) {
 		SSHPort: "22",
 	}
 
-	serverRecord, resolved, err := client.createServerWithFallbackInRegion(context.Background(), cfg, publicKey, "cbx_123", "mac-test", false, nil)
+	serverRecord, resolved, err := client.createServerWithFallbackInRegion(context.Background(), cfg, publicKey, "cbx_123", "mac-test", false, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

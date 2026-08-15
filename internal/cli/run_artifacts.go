@@ -314,6 +314,7 @@ type proofRenderInput struct {
 	RunID       string
 	Command     string
 	LogExcerpt  string
+	Captures    []streamCaptureMetadata
 	ActionsURL  string
 	Artifacts   []runArtifact
 	Variables   map[string]string
@@ -339,6 +340,7 @@ func writeRunProof(path, templateName string, input proofRenderInput) (runArtifa
 }
 
 func renderRunProof(input proofRenderInput) (string, error) {
+	input.LogExcerpt = proofConsoleEvidence(input.LogExcerpt, input.Captures)
 	values := proofTemplateValues(input)
 	tmpl := input.Template
 	behavior, err := renderProofTemplateField("behaviorAddressed", tmpl.BehaviorAddressed, "Remote behavior exercised by the Crabbox command.", values)
@@ -366,10 +368,10 @@ func renderRunProof(input proofRenderInput) (string, error) {
 	b.WriteString("Behavior addressed: " + behavior + "\n\n")
 	b.WriteString("Real environment tested: " + environment + "\n\n")
 	stepsOpenFence, stepsCloseFence := markdownFence("sh", steps)
-	b.WriteString("Exact steps or command run after this patch:\n\n" + stepsOpenFence + "\n")
+	b.WriteString("Exact steps or command run:\n\n" + stepsOpenFence + "\n")
 	b.WriteString(steps)
 	b.WriteString("\n" + stepsCloseFence + "\n\n")
-	b.WriteString("Evidence after fix: Copied live console output from Crabbox")
+	b.WriteString("Evidence: Copied live console output from Crabbox")
 	if input.RunID != "" {
 		b.WriteString(" `" + input.RunID + "`")
 	}
@@ -378,7 +380,7 @@ func renderRunProof(input proofRenderInput) (string, error) {
 	b.WriteString(":\n\n" + openFence + "\n")
 	b.WriteString(logExcerpt)
 	b.WriteString("\n" + closeFence + "\n\n")
-	b.WriteString("Observed result after fix: " + observed + "\n\n")
+	b.WriteString("Observed result: " + observed + "\n\n")
 	if len(input.Artifacts) > 0 || input.ActionsURL != "" {
 		b.WriteString("Additional evidence: ")
 		parts := make([]string, 0, len(input.Artifacts)+1)
@@ -392,6 +394,43 @@ func renderRunProof(input proofRenderInput) (string, error) {
 	}
 	b.WriteString("What was not tested: " + notTested + "\n")
 	return b.String(), nil
+}
+
+func proofConsoleEvidence(logExcerpt string, captures []streamCaptureMetadata) string {
+	logExcerpt = strings.TrimSpace(logExcerpt)
+	if len(captures) == 0 {
+		if logExcerpt == "" {
+			return "(no console output captured)"
+		}
+		return logExcerpt
+	}
+	if logExcerpt == "(no console output captured)" {
+		logExcerpt = ""
+	}
+	lines := make([]string, 0, len(captures)+1)
+	if logExcerpt != "" {
+		lines = append(lines, logExcerpt)
+	}
+	for _, capture := range captures {
+		lines = append(lines, fmt.Sprintf("captured stream=%s path=%s bytes=%d", capture.Label, quoteProofCapturePath(capture.Path), capture.Bytes))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func quoteProofCapturePath(path string) string {
+	const safe = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/.- "
+	var b strings.Builder
+	b.Grow(len(path) + 2)
+	b.WriteByte('"')
+	for _, value := range []byte(path) {
+		if strings.IndexByte(safe, value) >= 0 {
+			b.WriteByte(value)
+			continue
+		}
+		fmt.Fprintf(&b, "\\x%02x", value)
+	}
+	b.WriteByte('"')
+	return b.String()
 }
 
 func proofTemplateValues(input proofRenderInput) map[string]string {

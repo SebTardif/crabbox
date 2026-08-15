@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -158,22 +157,7 @@ wait "$child"
 	go func() {
 		done <- copyOverResolvedSSH(ctx, SSHTarget{User: "alice", Host: "example.test", Port: "22"}, "./input", "SANDBOX:/tmp/input", false, &bytes.Buffer{}, &bytes.Buffer{})
 	}()
-	deadline := time.Now().Add(5 * time.Second)
-	var childPID int
-	for time.Now().Before(deadline) {
-		data, err := os.ReadFile(pidPath)
-		if err == nil {
-			childPID, err = strconv.Atoi(strings.TrimSpace(string(data)))
-			if err != nil {
-				t.Fatal(err)
-			}
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	if childPID == 0 {
-		t.Fatal("rsync descendant did not start")
-	}
+	childPID := waitForPIDFile(t, pidPath)
 	cancel()
 	select {
 	case err := <-done:

@@ -27,18 +27,62 @@ That list is then filtered by the active excludes:
 - repo-local `sync.exclude` (config) patterns;
 - root `.crabboxignore` patterns.
 
+Before transfer, Crabbox checks tracked paths that remain in the effective
+manifest scope. If sparse-checkout rules or `skip-worktree` state hide one of
+those paths, sync stops instead of treating the omission as a deletion. Hidden
+paths outside `sync.include` or removed by ordered excludes are ignored.
+Gitlinks are not manifest files or remote file deletions, while symlinks remain
+file-like.
+
+Git 2.41 or newer distinguishes an intentional in-scope deletion from a sparse
+omission after index metadata becomes ambiguous. Older Git fails closed only
+for an ambiguous missing path that remains in the effective manifest scope.
+
 Git-ignored output, dependency folders, `.git`, and common local caches stay out
 of the transfer. This keeps a first sync close to what CI would see while still
 letting you test uncommitted local edits.
+
+### Jujutsu workspaces
+
+Crabbox currently supports Jujutsu workspaces only when they are colocated with
+Git metadata: the workspace root must contain both `.jj` and `.git`. Native
+Jujutsu revision mapping is not supported yet. Because the sync manifest is
+Git-owned, Crabbox rejects a native `.jj` workspace before leasing or borrowing
+a runner rather than letting Git discover an outer checkout and sync the wrong
+revision. This also applies when the native workspace is nested inside an outer
+Git repository.
+
+If you are starting from an existing Git checkout and want a colocated Jujutsu
+workspace, `jj git init --git-repo=.` is one initialization example. It does not
+convert an existing native Jujutsu repository in place. Use `--no-sync` when you
+intentionally want to run without transferring local files.
 
 The built-in excludes are intentionally conservative. They cover common churn
 such as `node_modules`, `.git`, `dist`, `coverage`, `playwright-report`,
 `test-results`, `.next`, `.vite`, `.turbo`, `target`, `.venv`, `__pycache__`,
 `.gradle`, and Crabbox runtime state under `.crabbox/env`,
 `.crabbox/scripts`, `.crabbox/logs`, `.crabbox/captures`, and
-`.crabbox/runs`. Crabbox does not globally drop tracked source files just
-because a path segment happens to be named `build` or `out`. Put
-project-specific generated directories in `.crabboxignore` or `sync.exclude`.
+`.crabbox/runs`. Built-in rules for the ambiguous artifact names `dist`,
+`dist-runtime`, `coverage`, `playwright-report`, `test-results`, `.build`, and
+`target` still omit untracked output, but do not omit a Git-tracked regular file
+solely because one of those names appears in its path. Crabbox reports a bounded
+path-and-pattern summary when it protects such files. Unmistakable dependency
+and cache rules such as `node_modules`, `.cache`, `.venv`, and `__pycache__`
+remain component-wide, including for tracked files.
+
+Except for the protected Crabbox runtime state described below, rules from
+`sync.exclude` and `.crabboxignore` are authoritative, including bare
+component-wide patterns. They can deliberately exclude tracked artifact files
+or trees, and a later `!pattern` can re-include them. This keeps existing
+repository policy intact across upgrades while making Crabbox-owned ambiguous
+defaults safe. Crabbox also does not globally drop tracked source files just
+because a path segment happens to be named `build` or `out`. Put project-specific
+generated directories in `.crabboxignore` or `sync.exclude`.
+
+`crabbox watch` observes only the ancestor chains needed by tracked protected
+files or explicit re-includes, so unrelated untracked artifact trees do not
+create watch churn. It also watches Git's resolved index and attaches the parent
+chain when an index-only transition makes an artifact path tracked.
 
 ## Excludes
 
@@ -77,7 +121,22 @@ Secrets must never be passed as command-line arguments or via broad env globs.
 
 ## Sync flow
 
-For an SSH-lease run, sync runs these steps:
+For an existing SSH lease, Crabbox first acquires a remote lease-scoped
+workspace owner. It does this before reading hydration state, Git metadata, or
+the sync fingerprint, and retains ownership through command execution, evidence
+collection, failure capture, and ready-pool cleanup. Separate clients and watch
+iterations contend on the same owner. Newly acquired one-shot leases bypass it
+because the acquisition itself is exclusive.
+
+The owner state lives under the remote user's Crabbox state directory, outside
+the replaceable checkout. Its filename is derived from a non-reversible lease
+digest, and its bounded contents contain only protocol version, expiry, random
+fencing token, and an optional witnessed child PID/start identity. Token-bound
+renewal and release fail closed. After a client crash, an expired owner is
+recoverable only when the exact witnessed child is no longer alive. POSIX,
+WSL2, and native Windows targets share these semantics.
+
+Once ownership is established, sync runs these steps:
 
 1. Resolve the local repository root.
 2. Build the sync manifest (the NUL-delimited file list) and a parallel list of
@@ -157,8 +216,11 @@ PR head; add `--apply-local-patch` to layer your local git diff on top. The
 
 Use `crabbox sync-plan` to inspect the manifest before leasing a box. It prints
 the candidate file count, total bytes, the count of deleted tracked paths, and
-the largest files and directories, using the same excludes as `run`. Use
-`--limit` to change how many top files and directories are listed (default 20).
+the largest files and directories, using the same excludes as `run`. When an
+ambiguous built-in artifact rule would otherwise hide a tracked regular file,
+the plan also prints a bounded annotation naming the protected paths and
+patterns. Use `--limit` to change how many top files and directories are listed
+(default 20).
 
 ```text
 $ crabbox sync-plan

@@ -175,7 +175,7 @@ func (a App) webvnc(ctx context.Context, args []string) error {
 		fmt.Fprintln(fs.Output(), "  --redact-credentials=false  reveal viewer credentials (unsafe)")
 		fmt.Fprintln(fs.Output(), "  --reclaim")
 	}
-	provider := fs.String("provider", defaults.Provider, "desktop SSH provider")
+	provider := registerProviderSelectionFlag(fs, defaults, "desktop SSH provider")
 	id := fs.String("id", "", "lease id or slug")
 	reclaim := fs.Bool("reclaim", false, "claim this lease for the current repo")
 	noProviderSideEffects := fs.Bool("no-provider-side-effects", false, "internal: resolve without claiming, touching, or heartbeating the provider")
@@ -389,6 +389,7 @@ func (a App) webvnc(ctx context.Context, args []string) error {
 	return serveWebVNCBridgePool(bridgeCtx, webVNCBridgePoolConfig{
 		Coord:              coord,
 		LeaseID:            leaseID,
+		ExpectedProvider:   cfg.Provider,
 		Host:               connHost,
 		Port:               connPort,
 		Credentials:        credentials,
@@ -493,6 +494,7 @@ func requireMacOSScreenSharingCredentials(credentials rfbCredentials) error {
 type webVNCBridgePoolConfig struct {
 	Coord              *CoordinatorClient
 	LeaseID            string
+	ExpectedProvider   string
 	Host               string
 	Port               string
 	Credentials        rfbCredentials
@@ -522,7 +524,10 @@ func serveWebVNCBridgePool(ctx context.Context, cfg webVNCBridgePoolConfig) erro
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	if !cfg.DisableHeartbeat && cfg.Coord != nil && strings.TrimSpace(cfg.LeaseID) != "" {
-		stopHeartbeat := startCoordinatorHeartbeat(ctx, cfg.Coord, cfg.LeaseID, cfg.IdleTimeout, nil, cfg.Telemetry, cfg.Log)
+		stopHeartbeat, err := startCoordinatorHeartbeat(ctx, cfg.Coord, cfg.LeaseID, cfg.ExpectedProvider, cfg.IdleTimeout, nil, cfg.Telemetry, cfg.Log)
+		if err != nil {
+			return err
+		}
 		defer stopHeartbeat()
 	}
 	events := make(chan webVNCBridgePoolEvent, cfg.PoolSize)
@@ -638,7 +643,7 @@ func (a App) webVNCDaemonCommand(ctx context.Context, args []string) error {
 func (a App) webVNCDaemonStart(ctx context.Context, args []string) error {
 	defaults := defaultConfig()
 	fs := newFlagSet("webvnc daemon start", a.Stderr)
-	provider := fs.String("provider", defaults.Provider, "desktop SSH provider")
+	provider := registerProviderSelectionFlag(fs, defaults, "desktop SSH provider")
 	id := fs.String("id", "", "lease id or slug")
 	localPort := fs.String("local-port", "", "local VNC tunnel port")
 	openPortal := fs.Bool("open", false, "open the web portal VNC page")
@@ -945,7 +950,7 @@ func (a App) webVNCStatusCommand(ctx context.Context, args []string) error {
 	defaults := defaultConfig()
 	fs := newFlagSet("webvnc status", a.Stderr)
 	redactCredentials := registerWebVNCCredentialOutputFlag(fs)
-	provider := fs.String("provider", defaults.Provider, "desktop SSH provider")
+	provider := registerProviderSelectionFlag(fs, defaults, "desktop SSH provider")
 	id := fs.String("id", "", "lease id or slug")
 	localPort := fs.String("local-port", "", "local VNC tunnel port")
 	expectedListenerOwnerPID := fs.Int("expected-listener-owner-pid", 0, "internal: expected WebVNC listener owner pid")
@@ -1120,7 +1125,7 @@ func (a App) webVNCResetCommand(ctx context.Context, args []string) error {
 	defaults := defaultConfig()
 	fs := newFlagSet("webvnc reset", a.Stderr)
 	redactCredentials := registerWebVNCCredentialOutputFlag(fs)
-	provider := fs.String("provider", defaults.Provider, "desktop SSH provider")
+	provider := registerProviderSelectionFlag(fs, defaults, "desktop SSH provider")
 	id := fs.String("id", "", "lease id or slug")
 	openPortal := fs.Bool("open", false, "open the web portal VNC page")
 	takeControl := fs.Bool("take-control", false, "ask the portal viewer to take keyboard and mouse control after connecting")

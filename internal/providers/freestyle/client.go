@@ -12,7 +12,6 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
-	"time"
 )
 
 type freestyleAPI interface {
@@ -95,7 +94,7 @@ var newFreestyleClient = func(cfg Config, rt Runtime) (freestyleAPI, error) {
 	}
 	httpClient := rt.HTTP
 	if httpClient == nil {
-		httpClient = &http.Client{Timeout: 60 * time.Second}
+		httpClient = http.DefaultClient
 	}
 	return &freestyleHTTPClient{
 		apiKey:     apiKey,

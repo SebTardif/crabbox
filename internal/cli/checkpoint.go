@@ -82,7 +82,7 @@ type checkpointRecord struct {
 func (a App) checkpointCreate(ctx context.Context, args []string) (err error) {
 	defaults := defaultConfig()
 	fs := newFlagSet("checkpoint create", a.Stderr)
-	provider := fs.String("provider", defaults.Provider, providerHelpSSH())
+	provider := registerProviderSelectionFlag(fs, defaults, providerHelpSSH())
 	id := fs.String("id", "", "lease id or slug")
 	name := fs.String("name", "", "checkpoint name")
 	mode := fs.String("mode", "auto", "checkpoint mode: auto, native, or archive")
@@ -235,7 +235,7 @@ func (a App) checkpointList(ctx context.Context, args []string) error {
 	fs := newFlagSet("checkpoint list", a.Stderr)
 	jsonOut := fs.Bool("json", false, "print JSON")
 	verify := fs.Bool("verify", false, "verify local artifacts and provider resources")
-	provider := fs.String("provider", defaults.Provider, providerHelpSSH())
+	provider := registerProviderSelectionFlag(fs, defaults, providerHelpSSH())
 	id := fs.String("id", "", "provider source VM id/name for provider-native snapshots")
 	tree := fs.Bool("tree", true, "show provider-native snapshots as a tree")
 	forkableOnly := fs.Bool("forkable-only", false, "show only forkable provider-native snapshots")
@@ -252,7 +252,7 @@ func (a App) checkpointList(ctx context.Context, args []string) error {
 	}
 	setIDFromFirstArg(fs, id)
 	if strings.TrimSpace(*id) != "" || flagWasSet(fs, "provider") || flagWasSet(fs, "parallels-template") {
-		cfg, err := loadLeaseTargetConfig(fs, *provider, targetFlags, networkFlags, leaseTargetConfigOptions{LeaseID: *id})
+		cfg, err := loadLeaseTargetConfig(fs, *provider, targetFlags, networkFlags, leaseTargetConfigOptions{LeaseID: *id, ProviderResourceID: true})
 		if err != nil {
 			return err
 		}
@@ -433,7 +433,7 @@ func parallelsSnapshotCheckpointView(source string, snapshot ParallelsSnapshot) 
 }
 
 func applyParallelsCheckpointHostConfig(cfg *Config, record checkpointRecord) {
-	cfg.Provider = "parallels"
+	setProviderSelection(cfg, "parallels", providerSelectionRecordedRun)
 	applyParallelsHostRefConfig(cfg, record.Native.Region)
 }
 
@@ -522,7 +522,7 @@ func printCheckpointInspect(stdout io.Writer, record checkpointRecord) {
 func (a App) checkpointRestore(ctx context.Context, args []string) error {
 	defaults := defaultConfig()
 	fs := newFlagSet("checkpoint restore", a.Stderr)
-	provider := fs.String("provider", defaults.Provider, providerHelpSSH())
+	provider := registerProviderSelectionFlag(fs, defaults, providerHelpSSH())
 	id := fs.String("id", "", "lease id or slug")
 	snapshot := fs.String("snapshot", "", "provider-native snapshot name or id")
 	dryRun := fs.Bool("dry-run", false, "show provider-native restore target without switching snapshots")
@@ -542,7 +542,7 @@ func (a App) checkpointRestore(ctx context.Context, args []string) error {
 		if fs.NArg() != 0 {
 			return exit(2, "usage: crabbox checkpoint restore --provider parallels --id <vm-or-lease> --snapshot <name-or-id>")
 		}
-		cfg, err := loadLeaseTargetConfig(fs, *provider, targetFlags, networkFlags, leaseTargetConfigOptions{LeaseID: *id})
+		cfg, err := loadLeaseTargetConfig(fs, *provider, targetFlags, networkFlags, leaseTargetConfigOptions{LeaseID: *id, ProviderResourceID: true})
 		if err != nil {
 			return err
 		}
@@ -728,6 +728,9 @@ func (a App) checkpointFork(ctx context.Context, args []string) (err error) {
 		}
 	}
 	if *dryRun {
+		if !providerSelectionIsActionable(cfg) {
+			return exit(2, "%s", providerSelectionRequiredDiagnostic)
+		}
 		for i := 1; i <= *count; i++ {
 			slug := checkpointForkFanoutSlug(requestedSlug, i, *count)
 			expandedCommand := checkpointForkRunCommand(runArgs, checkpointForkRunContext{Index: i, Total: *count, Slug: slug})
@@ -937,11 +940,8 @@ func validateCheckpointForkWorkdirs(ctx context.Context, backend Backend, lease 
 }
 
 func (a App) checkpointForkParallelsSnapshot(ctx context.Context, fs *flag.FlagSet, leaseFlags leaseCreateFlagValues, source, snapshot string, keep, reclaim bool, requestedSlug string, count int, dryRun bool, runArgs []string) (err error) {
-	cfg, err := loadConfig()
+	cfg, err := loadCheckpointForkParallelsConfig(fs, leaseFlags)
 	if err != nil {
-		return err
-	}
-	if err := applyLeaseCreateFlags(&cfg, fs, leaseFlags); err != nil {
 		return err
 	}
 	if cfg.Provider != "parallels" {
@@ -1012,6 +1012,18 @@ func (a App) checkpointForkParallelsSnapshot(ctx context.Context, fs *flag.FlagS
 	return nil
 }
 
+func loadCheckpointForkParallelsConfig(fs *flag.FlagSet, leaseFlags leaseCreateFlagValues) (Config, error) {
+	cfg, err := loadConfig()
+	if err != nil {
+		return Config{}, err
+	}
+	setProviderSelection(&cfg, "parallels", providerSelectionFlag)
+	if err := applyLeaseCreateFlags(&cfg, fs, leaseFlags); err != nil {
+		return Config{}, err
+	}
+	return cfg, nil
+}
+
 func (a App) checkpointForkParallelsSnapshotOnce(ctx context.Context, cfg Config, sshBackend SSHLeaseBackend, repo Repo, source, snapshot string, keep, reclaim bool, requestedSlug string, runOpts checkpointForkRunOptions) (err error) {
 	lease, err := sshBackend.Acquire(ctx, AcquireRequest{Repo: repo, Options: leaseOptionsFromConfig(cfg), Keep: keep, Reclaim: reclaim, RequestedSlug: requestedSlug})
 	if err != nil {
@@ -1043,7 +1055,7 @@ func (a App) checkpointForkParallelsSnapshotOnce(ctx context.Context, cfg Config
 func (a App) checkpointDelete(ctx context.Context, args []string) error {
 	defaults := defaultConfig()
 	fs := newFlagSet("checkpoint delete", a.Stderr)
-	provider := fs.String("provider", defaults.Provider, providerHelpSSH())
+	provider := registerProviderSelectionFlag(fs, defaults, providerHelpSSH())
 	sourceID := fs.String("id", "", "provider source VM id/name for provider-native snapshot")
 	snapshot := fs.String("snapshot", "", "provider-native snapshot name or id")
 	localOnly := fs.Bool("local-only", false, "delete only the local checkpoint record")
@@ -1065,7 +1077,7 @@ func (a App) checkpointDelete(ctx context.Context, args []string) error {
 		if *localOnly {
 			return exit(2, "--local-only applies only to recorded checkpoints")
 		}
-		cfg, err := loadLeaseTargetConfig(fs, *provider, targetFlags, networkFlags, leaseTargetConfigOptions{LeaseID: *sourceID})
+		cfg, err := loadLeaseTargetConfig(fs, *provider, targetFlags, networkFlags, leaseTargetConfigOptions{LeaseID: *sourceID, ProviderResourceID: true})
 		if err != nil {
 			return err
 		}

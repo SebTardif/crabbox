@@ -11,10 +11,13 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -23,6 +26,7 @@ import (
 func init() {
 	RegisterProvider(windowsEnvHelperTestProvider{})
 	RegisterProvider(runEnvProfileTestProvider{})
+	RegisterProvider(runReadyPoolPreflightTestProvider{})
 	RegisterProvider(runPrepareTestProvider{})
 	RegisterProvider(runModuleRuntimeTestProvider{})
 }
@@ -223,7 +227,25 @@ func installRecordingSSH(t *testing.T, dir string) string {
 	script := `#!/bin/sh
 cmd=""
 for arg do cmd="$arg"; done
-printf '%s\n---\n' "$cmd" >> "$CRABBOX_FAKE_SSH_LOG"
+decoded=""
+case "$cmd" in
+  *'payload_b64="'*'"; decoded=; if command -v base64'*)
+    payload_b64=${cmd#*'payload_b64="'}
+    payload_b64=${payload_b64%%'"; decoded=; if command -v base64'*}
+    decoded=$(printf %s "$payload_b64" | /usr/bin/base64 --decode 2>/dev/null) ||
+      decoded=$(printf %s "$payload_b64" | /usr/bin/base64 -d 2>/dev/null) ||
+      decoded=$(printf %s "$payload_b64" | /usr/bin/base64 -D 2>/dev/null) || decoded=""
+    ;;
+esac
+printf '%s\n%s\n---\n' "$cmd" "$decoded" >> "$CRABBOX_FAKE_SSH_LOG"
+match=$cmd
+if [ -n "$decoded" ]; then match=$decoded; fi
+case "$match" in
+  *"protocol_action='acquire'"*) printf ACQUIRED; exit 0 ;;
+  *"protocol_action='renew'"*) printf RENEWED; exit 0 ;;
+  *"protocol_action='inspect'"*) printf OWNED; exit 0 ;;
+  *"protocol_action='release'"*) printf RELEASED; exit 0 ;;
+esac
 if [ -n "${CRABBOX_FAKE_SSH_STDIN_LOG:-}" ]; then
   /bin/cat >> "$CRABBOX_FAKE_SSH_STDIN_LOG" || true
 else
@@ -318,6 +340,68 @@ func TestRunCommandInjectsReservedMetadataAcrossSSHCommandModes(t *testing.T) {
 	}
 }
 
+func TestRunCommandRetriesIdempotentRemoteWorkdirCreation(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell ssh fixture")
+	}
+	clearConfigEnv(t)
+	dir := t.TempDir()
+	isolateRunTestUserDirs(t, dir)
+	sshPath := filepath.Join(dir, "ssh")
+	mkdirCallsPath := filepath.Join(dir, "mkdir-calls")
+	firstMkdirPath := filepath.Join(dir, "first-mkdir")
+	mkdirCommandPath := filepath.Join(dir, "mkdir-command")
+	script := `#!/bin/sh
+remote=""
+for arg do remote="$arg"; done
+case "$remote" in
+  "mkdir -p "*)
+    if [ ! -e "$CRABBOX_FAKE_SSH_MKDIR_COMMAND" ]; then
+      printf '%s\n' "$remote" > "$CRABBOX_FAKE_SSH_MKDIR_COMMAND"
+    fi
+    IFS= read -r mkdir_command < "$CRABBOX_FAKE_SSH_MKDIR_COMMAND"
+    if [ "$remote" = "$mkdir_command" ]; then
+      printf 'call\n' >> "$CRABBOX_FAKE_SSH_MKDIR_CALLS"
+      if [ ! -e "$CRABBOX_FAKE_SSH_FIRST_MKDIR" ]; then
+        : > "$CRABBOX_FAKE_SSH_FIRST_MKDIR"
+        exit 255
+      fi
+    fi
+    ;;
+esac
+/bin/cat >/dev/null || true
+exit 0
+`
+	if err := os.WriteFile(sshPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+	t.Setenv("CRABBOX_CONFIG", filepath.Join(dir, "missing.yaml"))
+	t.Setenv("CRABBOX_FAKE_SSH_MKDIR_CALLS", mkdirCallsPath)
+	t.Setenv("CRABBOX_FAKE_SSH_FIRST_MKDIR", firstMkdirPath)
+	t.Setenv("CRABBOX_FAKE_SSH_MKDIR_COMMAND", mkdirCommandPath)
+	t.Setenv("CRABBOX_FAKE_SSH_PORT", "22")
+	t.Setenv("CRABBOX_FAKE_SSH_PROXY", "1")
+
+	var stdout, stderr bytes.Buffer
+	if err := (App{Stdout: &stdout, Stderr: &stderr}).runCommand(context.Background(), []string{
+		"--provider", "run-env-profile-test",
+		"--no-sync",
+		"--no-hydrate",
+		"--",
+		"true",
+	}); err != nil {
+		t.Fatalf("run error=%v\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
+	}
+	calls, err := os.ReadFile(mkdirCallsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(string(calls), "call\n"); got != 2 {
+		t.Fatalf("remote mkdir calls=%d want 2", got)
+	}
+}
+
 type windowsEnvHelperTestProvider struct{}
 
 func (windowsEnvHelperTestProvider) Name() string { return "windows-env-helper-test" }
@@ -404,16 +488,52 @@ func (p runEnvProfileTestProvider) Configure(Config, Runtime) (Backend, error) {
 	return runEnvProfileTestBackend{spec: p.Spec()}, nil
 }
 
+type runReadyPoolPreflightTestProvider struct{}
+
+func (runReadyPoolPreflightTestProvider) Name() string { return "run-ready-pool-preflight-test" }
+func (runReadyPoolPreflightTestProvider) Aliases() []string {
+	return nil
+}
+func (runReadyPoolPreflightTestProvider) Spec() ProviderSpec {
+	return ProviderSpec{
+		Name:        "run-ready-pool-preflight-test",
+		Kind:        ProviderKindSSHLease,
+		Targets:     []TargetSpec{{OS: targetLinux}},
+		Features:    FeatureSet{FeatureSSH, FeatureCrabboxSync},
+		Coordinator: CoordinatorSupported,
+	}
+}
+func (runReadyPoolPreflightTestProvider) RegisterFlags(*flag.FlagSet, Config) any {
+	return noProviderFlags{}
+}
+func (runReadyPoolPreflightTestProvider) ApplyFlags(*Config, *flag.FlagSet, any) error {
+	return nil
+}
+func (p runReadyPoolPreflightTestProvider) Configure(Config, Runtime) (Backend, error) {
+	return runEnvProfileTestBackend{spec: p.Spec()}, nil
+}
+
 type runEnvProfileTestBackend struct {
 	spec ProviderSpec
 }
 
+func (b runEnvProfileTestBackend) AcquireIsExclusiveOneShot() bool { return true }
+
 var runEnvProfileTestReleaseErr error
 var runEnvProfileTestReleaseHook func() error
+var runEnvProfileTestReleaseRequestHook func(ReleaseLeaseRequest) error
 var runEnvProfileTestConnectionCleanupSafe = true
+var runEnvProfileTestAcquireHook func(AcquireRequest)
+var runEnvProfileTestAcquireLease func(AcquireRequest) (LeaseTarget, error)
 
 func (b runEnvProfileTestBackend) Spec() ProviderSpec { return b.spec }
-func (b runEnvProfileTestBackend) Acquire(context.Context, AcquireRequest) (LeaseTarget, error) {
+func (b runEnvProfileTestBackend) Acquire(_ context.Context, req AcquireRequest) (LeaseTarget, error) {
+	if runEnvProfileTestAcquireHook != nil {
+		runEnvProfileTestAcquireHook(req)
+	}
+	if runEnvProfileTestAcquireLease != nil {
+		return runEnvProfileTestAcquireLease(req)
+	}
 	return LeaseTarget{
 		Server: Server{Provider: b.spec.Name},
 		SSH: SSHTarget{
@@ -441,13 +561,295 @@ func (b runEnvProfileTestBackend) ReleaseLease(ctx context.Context, req ReleaseL
 			return err
 		}
 	}
+	if runEnvProfileTestReleaseRequestHook != nil {
+		if err := runEnvProfileTestReleaseRequestHook(req); err != nil {
+			return err
+		}
+	}
 	return runEnvProfileTestReleaseErr
 }
-func (b runEnvProfileTestBackend) Touch(context.Context, TouchRequest) (Server, error) {
-	return Server{Provider: b.spec.Name}, nil
+func (b runEnvProfileTestBackend) Touch(_ context.Context, req TouchRequest) (Server, error) {
+	server := req.Lease.Server
+	server.Provider = b.spec.Name
+	return server, nil
+}
+
+func setupRunClaimSnapshotTest(t *testing.T) (LeaseTarget, leaseClaim) {
+	t.Helper()
+	clearConfigEnv(t)
+	dir := t.TempDir()
+	isolateRunTestUserDirs(t, dir)
+	installRecordingSSH(t, dir)
+	t.Setenv("CRABBOX_CONFIG", filepath.Join(dir, "missing.yaml"))
+	t.Setenv("CRABBOX_FAKE_SSH_PORT", "22")
+	t.Setenv("CRABBOX_FAKE_SSH_PROXY", "1")
+
+	repo, err := findRepo()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := baseConfig()
+	cfg.Provider = runEnvProfileTestProvider{}.Name()
+	lease := LeaseTarget{
+		LeaseID: "cbx_env_profile_test",
+		Server: Server{
+			CloudID:  "task-owned-container",
+			Provider: cfg.Provider,
+			Labels: map[string]string{
+				"lease":    "cbx_env_profile_test",
+				"provider": cfg.Provider,
+				"slug":     "claim-snapshot",
+				"state":    "ready",
+			},
+		},
+		SSH: SSHTarget{
+			User:           "crabbox",
+			Host:           "127.0.0.1",
+			Port:           "22",
+			TargetOS:       targetLinux,
+			SSHConfigProxy: true,
+		},
+	}
+	if err := claimLeaseTargetForRepoConfig(lease.LeaseID, "claim-snapshot", cfg, lease.Server, lease.SSH, repo.Root, cfg.IdleTimeout, false); err != nil {
+		t.Fatal(err)
+	}
+	initial, err := readLeaseClaim(lease.LeaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	SetServerLeaseClaimSnapshot(&lease.Server, initial, true)
+	runEnvProfileTestAcquireLease = func(AcquireRequest) (LeaseTarget, error) { return lease, nil }
+	t.Cleanup(func() {
+		runEnvProfileTestAcquireLease = nil
+		runEnvProfileTestReleaseRequestHook = nil
+		removeLeaseClaim(lease.LeaseID)
+	})
+	return lease, initial
+}
+
+func TestRunCommandOneShotCleanupUsesUpdatedClaimSnapshot(t *testing.T) {
+	lease, initial := setupRunClaimSnapshotTest(t)
+	resourceDeleted := false
+	runEnvProfileTestReleaseRequestHook = func(req ReleaseLeaseRequest) error {
+		claim, exists, set := ServerLeaseClaimSnapshot(req.Lease.Server)
+		if !set || !exists {
+			return errors.New("release did not receive a claim snapshot")
+		}
+		if claim.Revision == initial.Revision {
+			return errors.New("release received the pre-registration claim snapshot")
+		}
+		return removeLeaseClaimIfUnchangedAfter(req.Lease.LeaseID, claim, func() error {
+			resourceDeleted = true
+			return nil
+		})
+	}
+
+	var stdout, stderr bytes.Buffer
+	err := (App{Stdout: &stdout, Stderr: &stderr}).runCommand(context.Background(), []string{
+		"--provider", runEnvProfileTestProvider{}.Name(),
+		"--no-sync",
+		"--",
+		"true",
+	})
+	if err != nil {
+		t.Fatalf("run error=%v\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
+	}
+	if !resourceDeleted {
+		t.Fatal("task-owned resource was not deleted")
+	}
+	if _, exists, err := readLeaseClaimWithPresence(lease.LeaseID); err != nil || exists {
+		t.Fatalf("claim exists=%v err=%v after successful cleanup", exists, err)
+	}
+}
+
+func TestRunCommandCleanupRejectsClaimReplacedAfterRegistration(t *testing.T) {
+	lease, _ := setupRunClaimSnapshotTest(t)
+	resourceDeleted := false
+	runEnvProfileTestReleaseRequestHook = func(req ReleaseLeaseRequest) error {
+		claim, exists, set := ServerLeaseClaimSnapshot(req.Lease.Server)
+		if !set || !exists {
+			return errors.New("release did not receive a claim snapshot")
+		}
+		labels := cloneStringMap(claim.Labels)
+		labels["owner"] = "replacement-process"
+		if _, err := updateLeaseClaimLabelsIfUnchanged(req.Lease.LeaseID, claim, labels); err != nil {
+			return err
+		}
+		return removeLeaseClaimIfUnchangedAfter(req.Lease.LeaseID, claim, func() error {
+			resourceDeleted = true
+			return nil
+		})
+	}
+
+	var stdout, stderr bytes.Buffer
+	err := (App{Stdout: &stdout, Stderr: &stderr}).runCommand(context.Background(), []string{
+		"--provider", runEnvProfileTestProvider{}.Name(),
+		"--no-sync",
+		"--",
+		"true",
+	})
+	if err == nil || !strings.Contains(err.Error(), "claim changed") {
+		t.Fatalf("run error=%v, want ownership-change cleanup failure\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
+	}
+	if resourceDeleted {
+		t.Fatal("replacement-owned resource was deleted")
+	}
+	replacement, readErr := readLeaseClaim(lease.LeaseID)
+	if readErr != nil || replacement.Labels["owner"] != "replacement-process" {
+		t.Fatalf("replacement claim=%#v err=%v", replacement, readErr)
+	}
 }
 func (b runEnvProfileTestBackend) ReleaseLeaseConnectionCleanupSafe() bool {
 	return runEnvProfileTestConnectionCleanupSafe
+}
+
+type runWorkdirCase struct {
+	name       string
+	native     bool
+	diagnostic string
+	guidance   []string
+}
+
+func runWorkdirCases() []runWorkdirCase {
+	return []runWorkdirCase{
+		{name: "ordinary non-Git", diagnostic: "not a Git repository", guidance: []string{"git init", "--no-sync"}},
+		{name: "native Jujutsu", native: true, diagnostic: "native Jujutsu workspace", guidance: []string{"Git-manifest-based", "wrong revision", "colocated Git workspace", "jj git init --git-repo=.", "--no-sync"}},
+	}
+}
+
+func setupRunWorkdirCase(t *testing.T, tc runWorkdirCase) string {
+	t.Helper()
+	clearConfigEnv(t)
+	dir := t.TempDir()
+	isolateRunTestUserDirs(t, dir)
+	if tc.native {
+		makeNativeJujutsuWorkspace(t, dir)
+	}
+	t.Chdir(dir)
+	t.Setenv("CRABBOX_CONFIG", filepath.Join(dir, "missing.yaml"))
+	return dir
+}
+
+func TestRunWorkdirFailsBeforeAcquire(t *testing.T) {
+	for _, tc := range runWorkdirCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := setupRunWorkdirCase(t, tc)
+			acquireCalls := 0
+			runEnvProfileTestAcquireHook = func(AcquireRequest) { acquireCalls++ }
+			t.Cleanup(func() { runEnvProfileTestAcquireHook = nil })
+
+			var stdout, stderr bytes.Buffer
+			err := (App{Stdout: &stdout, Stderr: &stderr}).runCommand(context.Background(), []string{
+				"--provider", "run-env-profile-test",
+				"--", "true",
+			})
+			var exitErr ExitError
+			if !AsExitError(err, &exitErr) || exitErr.Code != 6 {
+				t.Fatalf("error=%v, want exit 6\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
+			}
+			if acquireCalls != 0 {
+				t.Fatalf("Acquire called %d time(s) before local manifest failure", acquireCalls)
+			}
+			for _, want := range append([]string{dir, tc.diagnostic}, tc.guidance...) {
+				if !strings.Contains(exitErr.Message, want) {
+					t.Fatalf("message missing %q: %q", want, exitErr.Message)
+				}
+			}
+		})
+	}
+}
+
+func TestRunWorkdirFailsBeforeReadyPoolBorrow(t *testing.T) {
+	for _, tc := range runWorkdirCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			setupRunWorkdirCase(t, tc)
+			requests := make(chan string, 1)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests <- r.Method + " " + r.URL.Path
+				http.Error(w, "unexpected request", http.StatusInternalServerError)
+			}))
+			t.Cleanup(server.Close)
+			t.Setenv("CRABBOX_COORDINATOR", server.URL)
+			t.Setenv("CRABBOX_COORDINATOR_TOKEN", "test-token")
+
+			var stdout, stderr bytes.Buffer
+			err := (App{Stdout: &stdout, Stderr: &stderr}).runCommand(context.Background(), []string{
+				"--provider", "run-ready-pool-preflight-test",
+				"--pool", "shared-linux",
+				"--pool-return", "drain",
+				"--", "true",
+			})
+			var exitErr ExitError
+			if !AsExitError(err, &exitErr) || exitErr.Code != 6 || !strings.Contains(exitErr.Message, tc.diagnostic) {
+				t.Fatalf("error=%v, want %s exit 6\nstdout=%s\nstderr=%s", err, tc.name, stdout.String(), stderr.String())
+			}
+			select {
+			case request := <-requests:
+				t.Fatalf("ready-pool request occurred before local manifest failure: %s", request)
+			default:
+			}
+		})
+	}
+}
+
+func TestRunBuildsSyncManifestAfterAcquire(t *testing.T) {
+	clearConfigEnv(t)
+	dir := t.TempDir()
+	isolateRunTestUserDirs(t, dir)
+	t.Chdir(dir)
+	t.Setenv("CRABBOX_CONFIG", filepath.Join(dir, "missing.yaml"))
+	runGit(t, dir, "init")
+	runGit(t, dir, "config", "user.email", "test@example.com")
+	runGit(t, dir, "config", "user.name", "Test")
+	writeFile(t, filepath.Join(dir, "before-acquire.txt"), "before\n")
+	runGit(t, dir, "add", ".")
+	runGit(t, dir, "commit", "-m", "init")
+
+	binDir := filepath.Join(dir, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sshPath := filepath.Join(binDir, "ssh")
+	if err := os.WriteFile(sshPath, []byte("#!/bin/sh\n/bin/cat >/dev/null || true\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rsyncLog := filepath.Join(dir, "rsync-manifest.log")
+	rsyncPath := filepath.Join(binDir, "rsync")
+	if err := os.WriteFile(rsyncPath, []byte("#!/bin/sh\n/bin/cat > \"$CRABBOX_FAKE_RSYNC_STDIN_LOG\"\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("CRABBOX_FAKE_RSYNC_STDIN_LOG", rsyncLog)
+	t.Setenv("CRABBOX_FAKE_SSH_PORT", "22")
+	t.Setenv("CRABBOX_FAKE_SSH_PROXY", "1")
+	acquireCalls := 0
+	runEnvProfileTestAcquireHook = func(req AcquireRequest) {
+		acquireCalls++
+		writeFile(t, filepath.Join(req.Repo.Root, "after-acquire.txt"), "after\n")
+	}
+	t.Cleanup(func() { runEnvProfileTestAcquireHook = nil })
+
+	var stdout, stderr bytes.Buffer
+	err := (App{Stdout: &stdout, Stderr: &stderr}).runCommand(context.Background(), []string{
+		"--provider", "run-env-profile-test",
+		"--", "true",
+	})
+	if err != nil {
+		t.Fatalf("run error=%v\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
+	}
+	if acquireCalls != 1 {
+		t.Fatalf("Acquire calls=%d, want 1", acquireCalls)
+	}
+	manifest, err := os.ReadFile(rsyncLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(manifest, []byte("before-acquire.txt\x00")) {
+		t.Fatalf("ordinary sync omitted initial file: %q", manifest)
+	}
+	if !bytes.Contains(manifest, []byte("after-acquire.txt\x00")) {
+		t.Fatalf("ordinary sync reused the pre-acquisition file list: %q", manifest)
+	}
 }
 
 type runPrepareTestProvider struct{}
@@ -563,25 +965,113 @@ func (b runModuleRuntimeTestBackend) Stop(context.Context, StopRequest) error {
 	return nil
 }
 
-func TestRunWithExistingLeaseRequestsProviderPreparation(t *testing.T) {
+func TestRunNoSyncRequestsExistingLeasePreparation(t *testing.T) {
+	for _, tc := range runWorkdirCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			setupRunWorkdirCase(t, tc)
+			runPrepareTestResolveRequests = nil
+
+			var stdout, stderr bytes.Buffer
+			err := (App{Stdout: &stdout, Stderr: &stderr}).runCommand(context.Background(), []string{
+				"--provider", "run-prepare-test",
+				"--id", "cbx_existing",
+				"--no-sync",
+				"--", "true",
+			})
+			var exitErr ExitError
+			if !AsExitError(err, &exitErr) || exitErr.Code != 9 || !strings.Contains(exitErr.Message, "resolve captured") {
+				t.Fatalf("run error=%v, want backend resolve proof\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
+			}
+			if strings.Contains(exitErr.Message, "native Jujutsu workspace") {
+				t.Fatalf("--no-sync triggered native Jujutsu guard: %q", exitErr.Message)
+			}
+			if len(runPrepareTestResolveRequests) != 1 {
+				t.Fatalf("resolve requests=%#v, want one", runPrepareTestResolveRequests)
+			}
+			if got := runPrepareTestResolveRequests[0]; got.ID != "cbx_existing" || !got.Prepare {
+				t.Fatalf("resolve request=%#v, want existing id with Prepare", got)
+			}
+		})
+	}
+}
+
+func TestRunWorkdirFailsBeforeExistingLeaseResolveAndPrepare(t *testing.T) {
+	for _, tc := range runWorkdirCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			setupRunWorkdirCase(t, tc)
+			runPrepareTestResolveRequests = nil
+
+			var stdout, stderr bytes.Buffer
+			err := (App{Stdout: &stdout, Stderr: &stderr}).runCommand(context.Background(), []string{
+				"--provider", "run-prepare-test",
+				"--id", "cbx_existing",
+				"--", "true",
+			})
+			var exitErr ExitError
+			if !AsExitError(err, &exitErr) || exitErr.Code != 6 || !strings.Contains(exitErr.Message, tc.diagnostic) {
+				t.Fatalf("error=%v, want %s exit 6\nstdout=%s\nstderr=%s", err, tc.name, stdout.String(), stderr.String())
+			}
+			if len(runPrepareTestResolveRequests) != 0 {
+				t.Fatalf("Resolve/Prepare called before local manifest failure: %#v", runPrepareTestResolveRequests)
+			}
+		})
+	}
+}
+
+func TestRunNonGitFreshPRStillResolvesExistingLease(t *testing.T) {
+	clearConfigEnv(t)
+	dir := t.TempDir()
+	isolateRunTestUserDirs(t, dir)
+	t.Chdir(dir)
+	t.Setenv("CRABBOX_CONFIG", filepath.Join(dir, "missing.yaml"))
 	runPrepareTestResolveRequests = nil
+
 	var stdout, stderr bytes.Buffer
 	err := (App{Stdout: &stdout, Stderr: &stderr}).runCommand(context.Background(), []string{
 		"--provider", "run-prepare-test",
 		"--id", "cbx_existing",
+		"--fresh-pr", "example-org/my-app#123",
+		"--", "true",
+	})
+	var exitErr ExitError
+	if !AsExitError(err, &exitErr) || exitErr.Code != 9 || !strings.Contains(exitErr.Message, "resolve captured") {
+		t.Fatalf("run error=%v, want resolve-captured exit\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
+	}
+	if len(runPrepareTestResolveRequests) != 1 || !runPrepareTestResolveRequests[0].Prepare {
+		t.Fatalf("fresh-PR run did not reach Resolve/Prepare: %#v", runPrepareTestResolveRequests)
+	}
+}
+
+func TestRunWithExistingLeaseRoutesProviderFromClaim(t *testing.T) {
+	clearConfigEnv(t)
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	t.Setenv("CRABBOX_PROVIDER", "hetzner")
+	repo, err := findRepo()
+	if err != nil {
+		t.Fatal(err)
+	}
+	const leaseID = "cbx_1257abcdefff"
+	if err := claimLeaseForRepoProvider(leaseID, "claim-routed", "run-prepare-test", repo.Root, time.Minute, false); err != nil {
+		t.Fatal(err)
+	}
+
+	runPrepareTestResolveRequests = nil
+	var stdout, stderr bytes.Buffer
+	err = (App{Stdout: &stdout, Stderr: &stderr}).runCommand(context.Background(), []string{
+		"--id", leaseID,
 		"--no-sync",
 		"--",
 		"true",
 	})
 	var exitErr ExitError
 	if !AsExitError(err, &exitErr) || exitErr.Code != 9 || !strings.Contains(exitErr.Message, "resolve captured") {
-		t.Fatalf("run error=%v, want resolve-captured exit", err)
+		t.Fatalf("run error=%v, want claim-routed resolve-captured exit; stderr=%s", err, stderr.String())
 	}
 	if len(runPrepareTestResolveRequests) != 1 {
 		t.Fatalf("resolve requests=%#v, want one", runPrepareTestResolveRequests)
 	}
-	if got := runPrepareTestResolveRequests[0]; got.ID != "cbx_existing" || !got.Prepare {
-		t.Fatalf("resolve request=%#v, want existing id with Prepare", got)
+	if got := runPrepareTestResolveRequests[0]; got.ID != leaseID || !got.Prepare {
+		t.Fatalf("resolve request=%#v, want claim-routed existing id with Prepare", got)
 	}
 }
 
@@ -937,8 +1427,13 @@ func TestRunCommandRejectsDelegatedScriptStdinBeforeReading(t *testing.T) {
 }
 
 func TestRunCommandPassesScriptToModuleDelegatedProvider(t *testing.T) {
+	clearConfigEnv(t)
 	runModuleRuntimeTestRequests = nil
-	script := filepath.Join(t.TempDir(), "worker.mjs")
+	dir := t.TempDir()
+	isolateRunTestUserDirs(t, dir)
+	t.Chdir(dir)
+	t.Setenv("CRABBOX_CONFIG", filepath.Join(dir, "missing.yaml"))
+	script := filepath.Join(dir, "worker.mjs")
 	if err := os.WriteFile(script, []byte("export default { fetch() { return new Response('ok') } }\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -1035,7 +1530,7 @@ func TestRunCommandInjectsReservedMetadataIntoStaticSSH(t *testing.T) {
 	logPath := installRecordingSSH(t, dir)
 	t.Setenv("CRABBOX_CONFIG", filepath.Join(dir, "missing.yaml"))
 	var stdout, stderr bytes.Buffer
-	err := (App{Stdout: &stdout, Stderr: &stderr}).runCommand(context.Background(), []string{
+	args := []string{
 		"--provider", "ssh",
 		"--static-host", "127.0.0.1",
 		"--static-user", "runner",
@@ -1043,9 +1538,11 @@ func TestRunCommandInjectsReservedMetadataIntoStaticSSH(t *testing.T) {
 		"--no-sync",
 		"--",
 		"env",
-	})
-	if err != nil {
-		t.Fatalf("static SSH run error=%v\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
+	}
+	for iteration := 0; iteration < 2; iteration++ {
+		if err := (App{Stdout: &stdout, Stderr: &stderr}).runCommand(context.Background(), args); err != nil {
+			t.Fatalf("static SSH run %d error=%v\nstdout=%s\nstderr=%s", iteration+1, err, stdout.String(), stderr.String())
+		}
 	}
 	data, err := os.ReadFile(logPath)
 	if err != nil {
@@ -1053,13 +1550,16 @@ func TestRunCommandInjectsReservedMetadataIntoStaticSSH(t *testing.T) {
 	}
 	logText := string(data)
 	for _, pattern := range []string{
-		`CRABBOX_LEASE_ID='static_[^']+'`,
-		`CRABBOX_RUN_ID='run_[a-f0-9]{12}'`,
-		`CRABBOX_SLUG=''`,
+		`CRABBOX_LEASE_ID=.*static_127-0-0-1`,
+		`CRABBOX_RUN_ID=.*run_[a-f0-9]{12}`,
+		`CRABBOX_SLUG=`,
 	} {
 		if !regexp.MustCompile(pattern).MatchString(logText) {
 			t.Fatalf("static SSH metadata %q missing:\n%s", pattern, logText)
 		}
+	}
+	if got := strings.Count(logText, "protocol_action='acquire'"); got != 2 {
+		t.Fatalf("static no-id owner acquisitions=%d want 2:\n%s", got, logText)
 	}
 }
 
@@ -1879,7 +2379,7 @@ for arg do
 done
 printf '%s\n---\n' "$cmd" >> "$CRABBOX_FAKE_SSH_LOG"
 case "$cmd" in
-  *"nohup bash -c"*) printf '123\n'; exit 0 ;;
+  *"nohup sh -c"*) printf '123\n'; exit 0 ;;
   *"kill -0 '123'"*) printf 'exit=unknown\nno marker written\n'; exit 0 ;;
 esac
 exit 0
@@ -2107,6 +2607,347 @@ func TestFullResyncSeedsPruneManifestFromGit(t *testing.T) {
 	}
 }
 
+type fullResyncActionsTestOptions struct {
+	noHydrate        bool
+	syncOnly         bool
+	failInvalidation bool
+	adoptedWorkspace string
+	workflow         string
+	mutateWorkflow   bool
+}
+
+type fullResyncActionsTestResult struct {
+	err             error
+	stdout          string
+	stderr          string
+	events          []string
+	resetCommand    string
+	syncTarget      string
+	hydrationScript string
+}
+
+func runFullResyncActionsTest(t *testing.T, opts fullResyncActionsTestOptions) fullResyncActionsTestResult {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("shell ssh fixture")
+	}
+	clearConfigEnv(t)
+	dir := t.TempDir()
+	isolateRunTestUserDirs(t, dir)
+	repoRoot := filepath.Join(dir, "crabbox")
+	workflowPath := filepath.Join(repoRoot, ".github", "workflows", "hydrate.yml")
+	if err := os.MkdirAll(filepath.Dir(workflowPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	workflow := opts.workflow
+	if workflow == "" {
+		workflow = `name: Hydrate
+on:
+  workflow_dispatch:
+    inputs:
+      crabbox_id:
+        required: true
+      crabbox_runner_label:
+        required: true
+      crabbox_keep_alive_minutes:
+        required: true
+jobs:
+  hydrate:
+    steps:
+      - run: echo prepared-snapshot
+`
+	}
+	if err := os.WriteFile(workflowPath, []byte(workflow), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{
+		{"init", "-q"},
+		{"config", "user.email", "test@example.com"},
+		{"config", "user.name", "Crabbox Test"},
+		{"add", "."},
+		{"commit", "-qm", "fixture"},
+	} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repoRoot
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	t.Chdir(repoRoot)
+	sshPath := filepath.Join(dir, "ssh")
+	rsyncPath := filepath.Join(dir, "rsync")
+	eventsPath := filepath.Join(dir, "events")
+	hydratedPath := filepath.Join(dir, "hydrated")
+	resetCommandPath := filepath.Join(dir, "reset-command")
+	syncTargetPath := filepath.Join(dir, "sync-target")
+	hydrationScriptPath := filepath.Join(dir, "hydration-script")
+	configPath := filepath.Join(dir, ".crabbox.yaml")
+	sshScript := `#!/bin/sh
+remote=""
+for arg do remote="$arg"; done
+current=$remote
+decoded_view=""
+decode_depth=0
+while [ "$decode_depth" -lt 3 ]; do
+  case "$current" in
+    *'payload_b64="'*'"; decoded=; if command -v base64'*)
+      payload_b64=${current#*'payload_b64="'}
+      payload_b64=${payload_b64%%'"; decoded=; if command -v base64'*}
+      current=$(printf %s "$payload_b64" | /usr/bin/base64 --decode 2>/dev/null) ||
+        current=$(printf %s "$payload_b64" | /usr/bin/base64 -d 2>/dev/null) ||
+        current=$(printf %s "$payload_b64" | /usr/bin/base64 -D 2>/dev/null) || break
+      decoded_view="$decoded_view
+$current"
+      decode_depth=$((decode_depth + 1))
+      ;;
+    *) break ;;
+  esac
+done
+if [ -n "$decoded_view" ]; then remote=$decoded_view; fi
+case "$remote" in
+  *"protocol_action='acquire'"*) printf 'owner-acquire\n' >> "$CRABBOX_FAKE_EVENTS"; printf ACQUIRED; exit 0 ;;
+  *"protocol_action='renew'"*) printf RENEWED; exit 0 ;;
+  *"protocol_action='inspect'"*)
+    if [ -e "$CRABBOX_FAKE_OWNER_CHILD" ]; then printf CHILD; else printf OWNED; fi
+    exit 0
+    ;;
+  *"protocol_action='release'"*) printf 'owner-release\n' >> "$CRABBOX_FAKE_EVENTS"; printf RELEASED; exit 0 ;;
+  *"rsync-stop."*"phase_live="*)
+    : > "$CRABBOX_FAKE_OWNER_CHILD"
+    printf '123\n'
+    exit 0
+    ;;
+  *'touch "$HOME/.crabbox/workspace-owners/'*"rsync-stop."*)
+    rm -f "$CRABBOX_FAKE_OWNER_CHILD"
+    exit 0
+    ;;
+  *"nohup"*"cbx_env_profile_test.local.sh"*)
+    printf 'hydrate\n' >> "$CRABBOX_FAKE_EVENTS"
+    : > "$CRABBOX_FAKE_HYDRATED"
+    printf '123\n'
+    ;;
+  *"rm -f"*".crabbox/actions/cbx_env_profile_test.env.sh"*)
+    printf 'clear\n' >> "$CRABBOX_FAKE_EVENTS"
+    ;;
+  *"rm -f"*".crabbox/actions/cbx_env_profile_test.env"*)
+    printf 'invalidate\n' >> "$CRABBOX_FAKE_EVENTS"
+    if [ "${CRABBOX_FAKE_INVALIDATE_FAIL:-0}" = "1" ]; then
+      printf 'marker invalidation denied\n' >&2
+      exit 1
+    fi
+    if [ "${CRABBOX_FAKE_MUTATE_WORKFLOW:-0}" = "1" ]; then
+      cat > "$CRABBOX_FAKE_WORKFLOW_PATH" <<'EOF'
+jobs:
+  hydrate:
+    steps:
+      - run: echo "${{ matrix.node }}"
+EOF
+    fi
+    ;;
+  *"rm -rf --"*)
+    printf 'reset\n' >> "$CRABBOX_FAKE_EVENTS"
+    printf '%s\n' "$remote" > "$CRABBOX_FAKE_RESET_COMMAND"
+    ;;
+  *"cat >"*"cbx_env_profile_test.local.sh"*)
+    /bin/cat > "$CRABBOX_FAKE_HYDRATION_SCRIPT"
+    exit 0
+    ;;
+  *"cat "*".crabbox/actions/cbx_env_profile_test.env"*)
+    if [ -e "$CRABBOX_FAKE_HYDRATED" ]; then
+      printf 'WORKSPACE=%s\n' "$CRABBOX_FAKE_CANONICAL_WORKSPACE"
+      printf '%s\n' \
+        'RUN_ID=local-cbx_env_profile_test' \
+        'ENV_FILE=/home/crabbox/.crabbox/actions/cbx_env_profile_test.env.sh'
+    else
+      printf 'WORKSPACE=%s\n' "$CRABBOX_FAKE_ADOPTED_WORKSPACE"
+      printf '%s\n' \
+        'RUN_ID=123' \
+        'ENV_FILE=/home/crabbox/.crabbox/actions/cbx_env_profile_test.env.sh'
+    fi
+    ;;
+  *"pnpm"*"test"*)
+    printf 'command\n' >> "$CRABBOX_FAKE_EVENTS"
+    ;;
+esac
+/bin/cat >/dev/null || true
+exit 0
+`
+	rsyncScript := `#!/bin/sh
+printf 'sync\n' >> "$CRABBOX_FAKE_EVENTS"
+last=""
+for arg do last="$arg"; done
+printf '%s\n' "$last" > "$CRABBOX_FAKE_SYNC_TARGET"
+exit 0
+`
+	if err := os.WriteFile(sshPath, []byte(sshScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(rsyncPath, []byte(rsyncScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, []byte("actions:\n  workflow: .github/workflows/hydrate.yml\nsync:\n  fingerprint: false\n  gitSeed: false\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("CRABBOX_CONFIG", configPath)
+	t.Setenv("CRABBOX_FAKE_SSH_PORT", "22")
+	t.Setenv("CRABBOX_FAKE_SSH_PROXY", "1")
+	t.Setenv("CRABBOX_FAKE_EVENTS", eventsPath)
+	t.Setenv("CRABBOX_FAKE_HYDRATED", hydratedPath)
+	t.Setenv("CRABBOX_FAKE_RESET_COMMAND", resetCommandPath)
+	t.Setenv("CRABBOX_FAKE_SYNC_TARGET", syncTargetPath)
+	t.Setenv("CRABBOX_FAKE_HYDRATION_SCRIPT", hydrationScriptPath)
+	t.Setenv("CRABBOX_FAKE_WORKFLOW_PATH", workflowPath)
+	t.Setenv("CRABBOX_FAKE_OWNER_CHILD", filepath.Join(dir, "owner-child"))
+	canonicalWorkspace := remoteJoin(defaultConfig(), "cbx_env_profile_test", "crabbox")
+	adoptedWorkspace := opts.adoptedWorkspace
+	if adoptedWorkspace == "" {
+		adoptedWorkspace = canonicalWorkspace
+	}
+	t.Setenv("CRABBOX_FAKE_CANONICAL_WORKSPACE", canonicalWorkspace)
+	t.Setenv("CRABBOX_FAKE_ADOPTED_WORKSPACE", adoptedWorkspace)
+	if opts.failInvalidation {
+		t.Setenv("CRABBOX_FAKE_INVALIDATE_FAIL", "1")
+	}
+	if opts.mutateWorkflow {
+		t.Setenv("CRABBOX_FAKE_MUTATE_WORKFLOW", "1")
+	}
+	args := []string{
+		"--provider", "run-env-profile-test",
+		"--id", "cbx_env_profile_test",
+		"--full-resync",
+	}
+	if opts.noHydrate {
+		args = append(args, "--no-hydrate")
+	}
+	if opts.syncOnly {
+		args = append(args, "--sync-only")
+	} else {
+		args = append(args, "--", "pnpm", "test")
+	}
+	var stdout, stderr bytes.Buffer
+	err := (App{Stdout: &stdout, Stderr: &stderr}).runCommand(context.Background(), args)
+	eventsData, readErr := os.ReadFile(eventsPath)
+	if readErr != nil && !os.IsNotExist(readErr) {
+		t.Fatal(readErr)
+	}
+	readOptional := func(path string) string {
+		data, err := os.ReadFile(path)
+		if err != nil && !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
+		return string(data)
+	}
+	return fullResyncActionsTestResult{
+		err:             err,
+		stdout:          stdout.String(),
+		stderr:          stderr.String(),
+		events:          strings.Fields(string(eventsData)),
+		resetCommand:    readOptional(resetCommandPath),
+		syncTarget:      readOptional(syncTargetPath),
+		hydrationScript: readOptional(hydrationScriptPath),
+	}
+}
+
+func assertRunEvents(t *testing.T, got, want []string) {
+	t.Helper()
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("events=%v want %v", got, want)
+	}
+}
+
+func TestRunCommandFullResyncRehydratesAdoptedActionsWorkspaceInOrderUnderOwner(t *testing.T) {
+	result := runFullResyncActionsTest(t, fullResyncActionsTestOptions{})
+	if result.err != nil {
+		t.Fatalf("run error=%v\nstdout=%s\nstderr=%s", result.err, result.stdout, result.stderr)
+	}
+	assertRunEvents(t, result.events, []string{"owner-acquire", "invalidate", "reset", "sync", "clear", "hydrate", "command", "owner-release"})
+	canonicalWorkspace := remoteJoin(defaultConfig(), "cbx_env_profile_test", "crabbox")
+	for name, value := range map[string]string{
+		"reset command":    result.resetCommand,
+		"sync target":      result.syncTarget,
+		"hydration script": result.hydrationScript,
+	} {
+		if !strings.Contains(value, canonicalWorkspace) {
+			t.Fatalf("%s does not use canonical workspace %q:\n%s", name, canonicalWorkspace, value)
+		}
+	}
+}
+
+func TestRunCommandFullResyncRejectsUnsupportedWorkflowBeforeRemoteMutation(t *testing.T) {
+	result := runFullResyncActionsTest(t, fullResyncActionsTestOptions{workflow: `jobs:
+  hydrate:
+    steps:
+      - run: echo "${{ matrix.node }}"
+`})
+	var exitErr ExitError
+	if !AsExitError(result.err, &exitErr) || exitErr.Code != 2 {
+		t.Fatalf("error=%v, want exit 2\nstdout=%s\nstderr=%s", result.err, result.stdout, result.stderr)
+	}
+	assertRunEvents(t, result.events, []string{"owner-acquire", "owner-release"})
+}
+
+func TestRunCommandFullResyncUsesPreparedWorkflowSnapshot(t *testing.T) {
+	result := runFullResyncActionsTest(t, fullResyncActionsTestOptions{mutateWorkflow: true})
+	if result.err != nil {
+		t.Fatalf("run error=%v\nstdout=%s\nstderr=%s", result.err, result.stdout, result.stderr)
+	}
+	if !strings.Contains(result.hydrationScript, "prepared-snapshot") || strings.Contains(result.hydrationScript, "matrix.node") {
+		t.Fatalf("hydration did not use prepared workflow snapshot:\n%s", result.hydrationScript)
+	}
+}
+
+func TestRunCommandFullResyncRejectsNonCanonicalAdoptedActionsWorkspace(t *testing.T) {
+	result := runFullResyncActionsTest(t, fullResyncActionsTestOptions{adoptedWorkspace: "/work/actions/crabbox"})
+	var exitErr ExitError
+	if !AsExitError(result.err, &exitErr) || exitErr.Code != 2 {
+		t.Fatalf("error=%v, want exit 2\nstdout=%s\nstderr=%s", result.err, result.stdout, result.stderr)
+	}
+	if !strings.Contains(exitErr.Message, "local hydration uses") {
+		t.Fatalf("message=%q", exitErr.Message)
+	}
+	assertRunEvents(t, result.events, []string{"owner-acquire", "owner-release"})
+}
+
+func TestRunCommandFullResyncNoHydrateFailsBeforeResetOrCommand(t *testing.T) {
+	result := runFullResyncActionsTest(t, fullResyncActionsTestOptions{noHydrate: true})
+	var exitErr ExitError
+	if !AsExitError(result.err, &exitErr) || exitErr.Code != 2 {
+		t.Fatalf("error=%v, want exit 2\nstdout=%s\nstderr=%s", result.err, result.stdout, result.stderr)
+	}
+	if !strings.Contains(exitErr.Message, "cannot rehydrate") {
+		t.Fatalf("message=%q", exitErr.Message)
+	}
+	assertRunEvents(t, result.events, []string{"owner-acquire", "owner-release"})
+}
+
+func TestRunCommandFullResyncInvalidationFailureStopsBeforeResetOrCommand(t *testing.T) {
+	result := runFullResyncActionsTest(t, fullResyncActionsTestOptions{failInvalidation: true})
+	var exitErr ExitError
+	if !AsExitError(result.err, &exitErr) || exitErr.Code != 7 {
+		t.Fatalf("error=%v, want exit 7\nstdout=%s\nstderr=%s", result.err, result.stdout, result.stderr)
+	}
+	if !strings.Contains(exitErr.Message, "invalidate GitHub Actions hydration marker") {
+		t.Fatalf("message=%q", exitErr.Message)
+	}
+	assertRunEvents(t, result.events, []string{"owner-acquire", "invalidate", "owner-release"})
+}
+
+func TestRunCommandFullResyncSyncOnlyInvalidatesWithoutRehydrate(t *testing.T) {
+	const adoptedWorkspace = "/work/actions/crabbox"
+	result := runFullResyncActionsTest(t, fullResyncActionsTestOptions{syncOnly: true, adoptedWorkspace: adoptedWorkspace})
+	if result.err != nil {
+		t.Fatalf("run error=%v\nstdout=%s\nstderr=%s", result.err, result.stdout, result.stderr)
+	}
+	assertRunEvents(t, result.events, []string{"owner-acquire", "invalidate", "reset", "sync", "owner-release"})
+	if !strings.Contains(result.resetCommand, adoptedWorkspace) || !strings.Contains(result.syncTarget, adoptedWorkspace) {
+		t.Fatalf("sync-only did not preserve adopted workspace reset/sync:\nreset=%s\nsync=%s", result.resetCommand, result.syncTarget)
+	}
+	if result.hydrationScript != "" {
+		t.Fatalf("sync-only unexpectedly installed hydration script:\n%s", result.hydrationScript)
+	}
+}
+
 func TestAllowRemoteSyncMassDeletionsForIncludeWhitelist(t *testing.T) {
 	cfg := baseConfig()
 	t.Setenv("CRABBOX_ALLOW_MASS_DELETIONS", "")
@@ -2174,6 +3015,189 @@ func TestRunCommandPreflightsLocalOutputOptions(t *testing.T) {
 			}
 			if !strings.Contains(exitErr.Message, tt.want) {
 				t.Fatalf("message=%q want %q", exitErr.Message, tt.want)
+			}
+		})
+	}
+}
+
+func TestFailureStreamCaptureRetainsMetadataAfterClose(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "stdout.bin")
+	capture := &failureStreamCapture{label: "stdout", explicitPath: path}
+	writer, explicit, err := capture.writer(io.Discard, &phaseMarkerWriter{}, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !explicit {
+		t.Fatal("explicit capture was not selected")
+	}
+	if _, ok := capture.metadata(); ok {
+		t.Fatal("capture metadata became available before close")
+	}
+	payload := []byte{0, 1, 2, 3, 4}
+	if _, err := writer.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	if err := capture.closeAfterStream(nil, 0, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	metadata, ok := capture.metadata()
+	if !ok {
+		t.Fatal("capture metadata missing after close")
+	}
+	if metadata.Label != "stdout" || metadata.Path != path || metadata.Bytes != int64(len(payload)) {
+		t.Fatalf("metadata=%+v", metadata)
+	}
+}
+
+func TestRunCommandProofReportsExplicitStreamCaptures(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX fake ssh fixture")
+	}
+	tests := []struct {
+		name          string
+		mode          string
+		captureStdout bool
+		captureStderr bool
+		stdoutData    []byte
+		stderrData    []byte
+		proofContains []string
+		proofExcludes []string
+	}{
+		{
+			name:          "text stdout capture",
+			mode:          "text-stdout",
+			captureStdout: true,
+			stdoutData:    []byte("captured text stdout\n"),
+			proofExcludes: []string{"captured text stdout", "(no console output captured)"},
+		},
+		{
+			name:          "binary control stdout capture",
+			mode:          "binary-stdout",
+			captureStdout: true,
+			stdoutData:    []byte{0, 1, 0x1b, '[', '3', '1', 'm', 'S', 'E', 'C', 'R', 'E', 'T', 0xff},
+			proofExcludes: []string{"SECRET", "\x00", "\x01", "\x1b", "(no console output captured)"},
+		},
+		{
+			name:          "both streams captured",
+			mode:          "both",
+			captureStdout: true,
+			captureStderr: true,
+			stdoutData:    []byte("stdout-only\n"),
+			stderrData:    []byte("stderr-only\n"),
+			proofExcludes: []string{"stdout-only", "stderr-only", "(no console output captured)"},
+		},
+		{
+			name:          "live stderr and captured stdout",
+			mode:          "live-stderr",
+			captureStdout: true,
+			stdoutData:    []byte("hidden stdout\n"),
+			stderrData:    []byte("visible live stderr\n"),
+			proofContains: []string{"visible live stderr"},
+			proofExcludes: []string{"hidden stdout", "(no console output captured)"},
+		},
+		{
+			name:          "no output and no captures",
+			mode:          "none",
+			proofContains: []string{"(no console output captured)"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			clearConfigEnv(t)
+			dir := t.TempDir()
+			isolateRunTestUserDirs(t, dir)
+			sshPath := filepath.Join(dir, "ssh")
+			sshScript := `#!/bin/sh
+remote=""
+for arg do remote="$arg"; done
+case "$remote" in
+  *"proof-capture-fixture"*)
+    case "$CRABBOX_TEST_CAPTURE_MODE" in
+      text-stdout) printf 'captured text stdout\n' ;;
+      binary-stdout) printf '\000\001\033[31mSECRET\377' ;;
+      both) printf 'stdout-only\n'; printf 'stderr-only\n' >&2 ;;
+      live-stderr) printf 'hidden stdout\n'; printf 'visible live stderr\n' >&2 ;;
+    esac
+    ;;
+esac
+exit 0
+`
+			if err := os.WriteFile(sshPath, []byte(sshScript), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+			t.Setenv("CRABBOX_CONFIG", filepath.Join(dir, "missing.yaml"))
+			t.Setenv("CRABBOX_FAKE_SSH_PORT", "22")
+			t.Setenv("CRABBOX_FAKE_SSH_PROXY", "1")
+			t.Setenv("CRABBOX_TEST_CAPTURE_MODE", tt.mode)
+
+			proofPath := filepath.Join(dir, "proof.md")
+			args := []string{
+				"--provider", "run-env-profile-test",
+				"--no-sync",
+				"--no-hydrate",
+				"--keep",
+				"--emit-proof", proofPath,
+			}
+			var stdoutPath, stderrPath string
+			if tt.captureStdout {
+				stdoutPath = filepath.Join(dir, "stdout`\n# proof-injection.bin")
+				args = append(args, "--capture-stdout", stdoutPath)
+			}
+			if tt.captureStderr {
+				stderrPath = filepath.Join(dir, "stderr.bin")
+				args = append(args, "--capture-stderr", stderrPath)
+			}
+			args = append(args, "--", "proof-capture-fixture")
+			var stdout, stderr bytes.Buffer
+			if err := (App{Stdout: &stdout, Stderr: &stderr}).runCommand(context.Background(), args); err != nil {
+				t.Fatalf("run error=%v\nstdout=%q\nstderr=%s", err, stdout.Bytes(), stderr.String())
+			}
+			proofData, err := os.ReadFile(proofPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			proof := string(proofData)
+			if tt.captureStdout {
+				got, err := os.ReadFile(stdoutPath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !bytes.Equal(got, tt.stdoutData) {
+					t.Fatalf("stdout capture=%q want=%q", got, tt.stdoutData)
+				}
+				metadata := fmt.Sprintf("captured stream=stdout path=%s bytes=%d", quoteProofCapturePath(stdoutPath), len(tt.stdoutData))
+				if !strings.Contains(proof, metadata) {
+					t.Fatalf("proof missing stdout metadata %q:\n%s", metadata, proof)
+				}
+			}
+			if tt.captureStderr {
+				got, err := os.ReadFile(stderrPath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !bytes.Equal(got, tt.stderrData) {
+					t.Fatalf("stderr capture=%q want=%q", got, tt.stderrData)
+				}
+				metadata := fmt.Sprintf("captured stream=stderr path=%s bytes=%d", quoteProofCapturePath(stderrPath), len(tt.stderrData))
+				if !strings.Contains(proof, metadata) {
+					t.Fatalf("proof missing stderr metadata %q:\n%s", metadata, proof)
+				}
+			}
+			if tt.captureStdout && tt.captureStderr {
+				if strings.Index(proof, "captured stream=stdout") > strings.Index(proof, "captured stream=stderr") {
+					t.Fatalf("capture metadata order is not stdout then stderr:\n%s", proof)
+				}
+			}
+			for _, want := range tt.proofContains {
+				if !strings.Contains(proof, want) {
+					t.Fatalf("proof missing %q:\n%s", want, proof)
+				}
+			}
+			for _, forbidden := range tt.proofExcludes {
+				if strings.Contains(proof, forbidden) {
+					t.Fatalf("proof contains forbidden %q:\n%s", forbidden, proof)
+				}
 			}
 		})
 	}
@@ -2565,6 +3589,67 @@ func TestValidatePreflightToolsRejectsUnknown(t *testing.T) {
 	}
 }
 
+func TestPythonPreflightToolValidationAndTargetFiltering(t *testing.T) {
+	if err := validatePreflightTools([]string{"python", "python3"}); err != nil {
+		t.Fatalf("python tools should validate: %v", err)
+	}
+	err := validatePreflightTools([]string{"python", "bogus", "python3"})
+	var exitErr ExitError
+	if !AsExitError(err, &exitErr) || exitErr.Code != 2 || !strings.Contains(exitErr.Message, `unknown preflight tool "bogus"`) {
+		t.Fatalf("error=%v, want exit 2 for bogus tool", err)
+	}
+
+	targets := []struct {
+		name   string
+		target SSHTarget
+	}{
+		{name: "linux", target: SSHTarget{TargetOS: targetLinux}},
+		{name: "macos", target: SSHTarget{TargetOS: targetMacOS}},
+		{name: "wsl2", target: SSHTarget{TargetOS: targetWindows, WindowsMode: windowsModeWSL2}},
+		{name: "windows", target: SSHTarget{TargetOS: targetWindows, WindowsMode: windowsModeNormal}},
+	}
+	for _, tt := range targets {
+		t.Run(tt.name, func(t *testing.T) {
+			got := preflightToolsForTarget(tt.target, []string{"python", "python3"})
+			if strings.Join(got, ",") != "python,python3" {
+				t.Fatalf("tools=%v", got)
+			}
+		})
+	}
+
+	for _, tool := range preflightToolsForTarget(SSHTarget{TargetOS: targetLinux}, nil) {
+		if tool == "python" || tool == "python3" {
+			t.Fatalf("%s must remain opt-in, default tools=%v", tool, defaultPreflightToolNames)
+		}
+	}
+}
+
+func TestPythonPreflightPOSIXProbeUsesLiteralExecutableAndMissingContract(t *testing.T) {
+	script := remoteCapabilityPreflightCommand("/work/repo", nil, nil, []string{"python", "python3"})
+	for _, want := range []string{
+		`preflight_cmd '\''python'\'' '\''python'\'' python --version`,
+		`preflight_cmd '\''python3'\'' '\''python3'\'' python3 --version`,
+		`printf '\''%s=missing\n'\'' "$label"`,
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("POSIX preflight script missing %q in %q", want, script)
+		}
+	}
+}
+
+func TestPythonPreflightWindowsProbeUsesLiteralExecutableAndMissingContract(t *testing.T) {
+	script := windowsRemoteCapabilityPreflightScript(`C:\crabbox\repo`, nil, nil, []string{"python", "python3"})
+	for _, want := range []string{
+		`Test-Tool 'python' 'python' @('--version')`,
+		`Test-Tool 'python3' 'python3' @('--version')`,
+		`Write-Output ($Label + "=missing")`,
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("Windows preflight script missing %q in %q", want, script)
+		}
+	}
+}
+
 func TestDelegatedPreflightPrintsUnsupportedMessage(t *testing.T) {
 	var stderr bytes.Buffer
 	printDelegatedPreflightUnsupported(&stderr, "e2b")
@@ -2688,17 +3773,61 @@ func TestWriteLocalFailureBundleIncludesMetadataStreamsAndRemoteFiles(t *testing
 		t.Fatalf("remote capture command failed: %v\n%s", err, out)
 	}
 
+	const (
+		urlUser     = "url-user"
+		urlPassword = "url-password"
+	)
+	knownSecrets := []string{
+		"configured-overlap-secret",
+		"overlap-secret",
+		"configured-profile-secret",
+		"forwarded-exact-secret",
+		"q7x",
+		"z9q",
+		urlUser,
+		urlPassword,
+		"query-token",
+		"assignment-token",
+		"client-token",
+		"header-token",
+	}
+	commandDisplay := strings.Join([]string{
+		"deploy --region us-west-2 --artifact report.json",
+		"--endpoint=https://" + urlUser + ":" + urlPassword + "@example.test/v1?token=query-token&trace=keep",
+		"api-key=assignment-token client-secret:client-token --token=forwarded-exact-secret",
+		"configured-overlap-secret overlap-secret configured-profile-secret",
+		"forwarded-exact-secret forwarded-exact-secret q7x",
+		"--header 'Authorization: Bearer header-token'",
+		"z9q",
+	}, " ")
 	local, _, err := writeLocalFailureBundle("bundle.tar.gz", filepath.Join(remoteWorkdir, ".crabbox", "remote.tar.gz"), FailureCaptureMetadata{
-		Provider:   "aws",
-		LeaseID:    "cbx_123",
-		Slug:       "blue-crab",
-		RunID:      "run_123",
-		Workdir:    "/work/crabbox/cbx_123/repo",
-		ExitCode:   7,
-		Timing:     timingReport{Provider: "aws", LeaseID: "cbx_123", ExitCode: 7},
-		EnvAllow:   []string{"API_TOKEN"},
-		Env:        map[string]string{"API_TOKEN": "secret-value"},
-		Config:     Config{Provider: "aws", TargetOS: targetLinux, Class: "standard", IdleTimeout: time.Minute, TTL: time.Hour, WorkRoot: "/work/crabbox"},
+		Provider:       "aws",
+		LeaseID:        "cbx_123",
+		Slug:           "blue-crab",
+		RunID:          "run_123",
+		CommandDisplay: commandDisplay,
+		Workdir:        "/work/crabbox/cbx_123/repo",
+		ExitCode:       7,
+		Timing:         timingReport{Provider: "aws", LeaseID: "cbx_123", ExitCode: 7},
+		EnvAllow:       []string{"API_TOKEN", "OVERLAP_TOKEN", "SHORT_SECRET", "TRAILING_SECRET"},
+		Env: map[string]string{
+			"API_TOKEN":       "forwarded-exact-secret",
+			"OVERLAP_TOKEN":   "overlap-secret",
+			"SHORT_SECRET":    "q7x",
+			"TRAILING_SECRET": "z9q ",
+		},
+		Config: Config{
+			Provider:    "aws",
+			TargetOS:    targetLinux,
+			Class:       "standard",
+			IdleTimeout: time.Minute,
+			TTL:         time.Hour,
+			WorkRoot:    "/work/crabbox",
+			CoordToken:  "configured-overlap-secret",
+			Profiles: map[string]ProfileConfig{
+				"proof": {Env: map[string]string{"SERVICE_TOKEN": "configured-profile-secret"}},
+			},
+		},
 		StdoutPath: stdoutPath,
 		StderrPath: stderrPath,
 	})
@@ -2719,9 +3848,29 @@ func TestWriteLocalFailureBundleIncludesMetadataStreamsAndRemoteFiles(t *testing
 			t.Fatalf("bundle missing %q; entries=%#v", want, contents)
 		}
 	}
+	var runMetadata struct {
+		Command string `json:"command"`
+		RunID   string `json:"runId"`
+	}
+	if err := json.Unmarshal(contents["crabbox-artifacts/crabbox-run.json"], &runMetadata); err != nil {
+		t.Fatalf("decode crabbox-run.json: %v", err)
+	}
+	if runMetadata.RunID != "run_123" {
+		t.Fatalf("run metadata ID=%q, want durable run_123", runMetadata.RunID)
+	}
+	for _, want := range []string{"deploy", "--region us-west-2", "--artifact report.json", "example.test/v1", "trace=keep"} {
+		if !strings.Contains(runMetadata.Command, want) {
+			t.Fatalf("redacted command lost harmless context %q: %q", want, runMetadata.Command)
+		}
+	}
+	if !strings.Contains(runMetadata.Command, diagnosticRedaction) {
+		t.Fatalf("command metadata contains no redaction marker: %q", runMetadata.Command)
+	}
 	for name, data := range contents {
-		if bytes.Contains(data, []byte("secret-value")) {
-			t.Fatalf("bundle entry %s leaked secret value", name)
+		for _, secret := range knownSecrets {
+			if bytes.Contains(data, []byte(secret)) {
+				t.Fatalf("bundle entry %s leaked known secret %q", name, secret)
+			}
 		}
 	}
 }
@@ -2805,15 +3954,16 @@ func TestNativeWindowsFailureBundleUsesLocalStreams(t *testing.T) {
 		t.Fatal(err)
 	}
 	local, _, err := captureFailureBundle(context.Background(), SSHTarget{TargetOS: targetWindows, WindowsMode: windowsModeNormal}, "C:\\crabbox\\repo", "cbx_win", "run_win", FailureCaptureMetadata{
-		Provider:   "aws",
-		LeaseID:    "cbx_win",
-		RunID:      "run_win",
-		Workdir:    "C:\\crabbox\\repo",
-		ExitCode:   9,
-		Timing:     timingReport{Provider: "aws", LeaseID: "cbx_win", ExitCode: 9},
-		Config:     Config{Provider: "aws", TargetOS: targetWindows, WindowsMode: windowsModeNormal},
-		StdoutPath: stdoutPath,
-		StderrPath: stderrPath,
+		Provider:       "aws",
+		LeaseID:        "cbx_win",
+		RunID:          "run_win",
+		CommandDisplay: "dotnet test --configuration Release",
+		Workdir:        "C:\\crabbox\\repo",
+		ExitCode:       9,
+		Timing:         timingReport{Provider: "aws", LeaseID: "cbx_win", ExitCode: 9},
+		Config:         Config{Provider: "aws", TargetOS: targetWindows, WindowsMode: windowsModeNormal},
+		StdoutPath:     stdoutPath,
+		StderrPath:     stderrPath,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -2824,6 +3974,16 @@ func TestNativeWindowsFailureBundleUsesLocalStreams(t *testing.T) {
 	}
 	if !bytes.Contains(contents["crabbox-artifacts/stderr.log"], []byte("native stderr")) {
 		t.Fatalf("stderr missing: %#v", contents["crabbox-artifacts/stderr.log"])
+	}
+	var runMetadata struct {
+		Command string `json:"command"`
+		RunID   string `json:"runId"`
+	}
+	if err := json.Unmarshal(contents["crabbox-artifacts/crabbox-run.json"], &runMetadata); err != nil {
+		t.Fatalf("decode native Windows crabbox-run.json: %v", err)
+	}
+	if runMetadata.Command != "dotnet test --configuration Release" || runMetadata.RunID != "run_win" {
+		t.Fatalf("native Windows run metadata=%+v", runMetadata)
 	}
 	if _, ok := contents["crabbox-artifacts/remote/.crabbox/capture-manifest.txt"]; ok {
 		t.Fatalf("native Windows bundle should be local-only: %#v", contents)
@@ -3027,6 +4187,234 @@ func TestApplyCapacityMarketFlag(t *testing.T) {
 	if err := applyCapacityMarketFlag(&cfg, fs, *market); err == nil {
 		t.Fatal("expected invalid market failure")
 	}
+}
+
+func TestAutoRouteClaimLeaseProvider(t *testing.T) {
+	newFlags := func(t *testing.T, configured string, args ...string) (*flag.FlagSet, *string) {
+		t.Helper()
+		fs := newFlagSet("test", io.Discard)
+		provider := fs.String("provider", configured, "")
+		if err := parseFlags(fs, args); err != nil {
+			t.Fatal(err)
+		}
+		return fs, provider
+	}
+
+	t.Run("exact id canonicalizes fixed AWS marker", func(t *testing.T) {
+		t.Setenv("XDG_STATE_HOME", t.TempDir())
+		const leaseID = "cbx_1257aaaa0001"
+		if err := claimLeaseForRepoProvider(leaseID, "fixed", FixedAWSClaimProvider, "/repo", time.Minute, false); err != nil {
+			t.Fatal(err)
+		}
+		fs, provider := newFlags(t, "hetzner")
+		cfg := Config{Provider: *provider}
+		if err := autoRouteClaimLeaseProvider(&cfg, fs, leaseID); err != nil {
+			t.Fatal(err)
+		}
+		if cfg.Provider != "aws" {
+			t.Fatalf("provider=%q want aws", cfg.Provider)
+		}
+		if cfg.providerSelectionSource != providerSelectionLeaseContext {
+			t.Fatalf("provider source=%q want %q", cfg.providerSelectionSource, providerSelectionLeaseContext)
+		}
+	})
+
+	t.Run("exact id wins over slug collision", func(t *testing.T) {
+		t.Setenv("XDG_STATE_HOME", t.TempDir())
+		const leaseID = "cbx_1257aaaa0002"
+		if err := claimLeaseForRepoProvider(leaseID, "exact-owner", "run-prepare-test", "/repo-a", time.Minute, false); err != nil {
+			t.Fatal(err)
+		}
+		if err := claimLeaseForRepoProvider("cbx_1257bbbb0002", leaseID, "local-container", "/repo-b", time.Minute, false); err != nil {
+			t.Fatal(err)
+		}
+		fs, provider := newFlags(t, "hetzner")
+		cfg := Config{Provider: *provider}
+		if err := autoRouteClaimLeaseProvider(&cfg, fs, leaseID); err != nil {
+			t.Fatal(err)
+		}
+		if cfg.Provider != "run-prepare-test" {
+			t.Fatalf("provider=%q want exact claim provider", cfg.Provider)
+		}
+	})
+
+	t.Run("unique slug routes provider", func(t *testing.T) {
+		t.Setenv("XDG_STATE_HOME", t.TempDir())
+		if err := claimLeaseForRepoProvider("cbx_1257aaaa0003", "Blue Lobster", "local-container", "/repo", time.Minute, false); err != nil {
+			t.Fatal(err)
+		}
+		fs, provider := newFlags(t, "hetzner")
+		cfg := Config{Provider: *provider}
+		if err := autoRouteClaimLeaseProvider(&cfg, fs, "blue-lobster"); err != nil {
+			t.Fatal(err)
+		}
+		if cfg.Provider != "local-container" {
+			t.Fatalf("provider=%q want local-container", cfg.Provider)
+		}
+		if cfg.providerSelectionSource != providerSelectionLeaseContext {
+			t.Fatalf("provider source=%q want %q", cfg.providerSelectionSource, providerSelectionLeaseContext)
+		}
+	})
+
+	t.Run("duplicate slug within one provider defers scope resolution", func(t *testing.T) {
+		t.Setenv("XDG_STATE_HOME", t.TempDir())
+		for _, leaseID := range []string{"cbx_1257aaaa0007", "cbx_1257bbbb0007"} {
+			if err := claimLeaseForRepoProviderScope(leaseID, "Scoped Slug", "local-container", leaseID, "/repo", time.Minute, false); err != nil {
+				t.Fatal(err)
+			}
+		}
+		fs, provider := newFlags(t, "hetzner")
+		cfg := Config{Provider: *provider}
+		if err := autoRouteClaimLeaseProvider(&cfg, fs, "scoped-slug"); err != nil {
+			t.Fatal(err)
+		}
+		if cfg.Provider != "local-container" {
+			t.Fatalf("provider=%q want local-container", cfg.Provider)
+		}
+	})
+
+	t.Run("aliases of one provider do not create ambiguity", func(t *testing.T) {
+		t.Setenv("XDG_STATE_HOME", t.TempDir())
+		for i, providerName := range []string{"external", "exec-provider"} {
+			leaseID := fmt.Sprintf("cbx_1257eeee000%d", i)
+			if err := claimLeaseForRepoProviderScope(leaseID, "External Alias", providerName, leaseID, "/repo", time.Minute, false); err != nil {
+				t.Fatal(err)
+			}
+		}
+		fs, provider := newFlags(t, "hetzner")
+		cfg := Config{Provider: *provider}
+		if err := autoRouteClaimLeaseProvider(&cfg, fs, "external-alias"); err != nil {
+			t.Fatal(err)
+		}
+		if cfg.Provider != "external" {
+			t.Fatalf("provider=%q want external", cfg.Provider)
+		}
+	})
+
+	t.Run("ambiguous slug fails with guidance", func(t *testing.T) {
+		t.Setenv("XDG_STATE_HOME", t.TempDir())
+		if err := claimLeaseForRepoProvider("cbx_1257aaaa0004", "Shared Slug", "local-container", "/repo-a", time.Minute, false); err != nil {
+			t.Fatal(err)
+		}
+		if err := claimLeaseForRepoProvider("cbx_1257bbbb0004", "Shared Slug", "run-prepare-test", "/repo-b", time.Minute, false); err != nil {
+			t.Fatal(err)
+		}
+		fs, provider := newFlags(t, "hetzner")
+		cfg := Config{Provider: *provider}
+		err := autoRouteClaimLeaseProvider(&cfg, fs, "shared-slug")
+		if err == nil || !strings.Contains(err.Error(), "canonical lease id") || !strings.Contains(err.Error(), "--provider") {
+			t.Fatalf("err=%v, want ambiguity guidance", err)
+		}
+	})
+
+	t.Run("explicit provider remains authoritative", func(t *testing.T) {
+		t.Setenv("XDG_STATE_HOME", t.TempDir())
+		const leaseID = "cbx_1257aaaa0005"
+		if err := claimLeaseForRepoProvider(leaseID, "explicit", "local-container", "/repo", time.Minute, false); err != nil {
+			t.Fatal(err)
+		}
+		fs, provider := newFlags(t, "hetzner", "--provider", "run-prepare-test")
+		cfg := Config{Provider: *provider}
+		if err := autoRouteClaimLeaseProvider(&cfg, fs, leaseID); err != nil {
+			t.Fatal(err)
+		}
+		if cfg.Provider != "run-prepare-test" {
+			t.Fatalf("provider=%q want explicit provider", cfg.Provider)
+		}
+	})
+
+	t.Run("legacy claim without provider preserves configured provider", func(t *testing.T) {
+		t.Setenv("XDG_STATE_HOME", t.TempDir())
+		const leaseID = "cbx_1257aaaa0006"
+		if err := claimLeaseForRepo(leaseID, "legacy", "/repo", time.Minute, false); err != nil {
+			t.Fatal(err)
+		}
+		fs, provider := newFlags(t, "hetzner")
+		cfg := Config{Provider: *provider}
+		if err := autoRouteClaimLeaseProvider(&cfg, fs, leaseID); err != nil {
+			t.Fatal(err)
+		}
+		if cfg.Provider != "hetzner" {
+			t.Fatalf("provider=%q want configured provider", cfg.Provider)
+		}
+	})
+
+	t.Run("provider-empty slug preserves configured provider", func(t *testing.T) {
+		t.Setenv("XDG_STATE_HOME", t.TempDir())
+		if err := claimLeaseForRepo("cbx_1257aaaa0008", "Legacy Slug", "/repo", time.Minute, false); err != nil {
+			t.Fatal(err)
+		}
+		fs, provider := newFlags(t, "hetzner")
+		cfg := Config{Provider: *provider}
+		if err := autoRouteClaimLeaseProvider(&cfg, fs, "legacy-slug"); err != nil {
+			t.Fatal(err)
+		}
+		if cfg.Provider != "hetzner" {
+			t.Fatalf("provider=%q want configured provider", cfg.Provider)
+		}
+	})
+
+	t.Run("missing identifier preserves configured provider", func(t *testing.T) {
+		t.Setenv("XDG_STATE_HOME", t.TempDir())
+		fs, provider := newFlags(t, "hetzner")
+		cfg := Config{Provider: *provider}
+		if err := autoRouteClaimLeaseProvider(&cfg, fs, "missing-slug"); err != nil {
+			t.Fatal(err)
+		}
+		if cfg.Provider != "hetzner" {
+			t.Fatalf("provider=%q want configured provider", cfg.Provider)
+		}
+	})
+
+	t.Run("empty identifier preserves configured provider", func(t *testing.T) {
+		fs, provider := newFlags(t, "hetzner")
+		cfg := Config{Provider: *provider}
+		if err := autoRouteClaimLeaseProvider(&cfg, fs, ""); err != nil {
+			t.Fatal(err)
+		}
+		if cfg.Provider != "hetzner" {
+			t.Fatalf("provider=%q want configured provider", cfg.Provider)
+		}
+	})
+
+	t.Run("malformed exact claim fails", func(t *testing.T) {
+		t.Setenv("XDG_STATE_HOME", t.TempDir())
+		const leaseID = "cbx_1257aaaa0009"
+		path, err := leaseClaimPath(leaseID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("{"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		fs, provider := newFlags(t, "hetzner")
+		cfg := Config{Provider: *provider}
+		if err := autoRouteClaimLeaseProvider(&cfg, fs, leaseID); err == nil || !strings.Contains(err.Error(), "parse claim") {
+			t.Fatalf("err=%v, want malformed exact claim failure", err)
+		}
+	})
+
+	t.Run("malformed claim directory entry fails slug routing", func(t *testing.T) {
+		t.Setenv("XDG_STATE_HOME", t.TempDir())
+		path, err := leaseClaimPath("cbx_1257aaaa0010")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("{"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		fs, provider := newFlags(t, "hetzner")
+		cfg := Config{Provider: *provider}
+		if err := autoRouteClaimLeaseProvider(&cfg, fs, "some-slug"); err == nil || !strings.Contains(err.Error(), "parse claim") {
+			t.Fatalf("err=%v, want malformed claim directory failure", err)
+		}
+	})
 }
 
 func TestApplyLeaseCreateFlagsForExistingAWSMacOSLeaseDefaultsOnDemand(t *testing.T) {

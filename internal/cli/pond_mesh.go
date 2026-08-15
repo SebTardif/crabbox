@@ -572,7 +572,7 @@ func collectPondMembersAcrossProviders(ctx context.Context, rt Runtime, cfg Conf
 	byProvider := make(map[string][]leaseClaim)
 	order := make([]string, 0, 4)
 	for _, claim := range matches {
-		key := strings.TrimSpace(claim.Provider)
+		key := canonicalClaimProvider(claim.Provider)
 		if _, seen := byProvider[key]; !seen {
 			order = append(order, key)
 		}
@@ -588,7 +588,7 @@ func collectPondMembersAcrossProviders(ctx context.Context, rt Runtime, cfg Conf
 			continue
 		}
 		providerCfg := cfg
-		providerCfg.Provider = p
+		setProviderSelection(&providerCfg, p, providerSelectionLeaseContext)
 		backend, berr := loadBackend(providerCfg, rt)
 		if berr != nil {
 			return nil, nil, fmt.Errorf("load backend for provider %s: %w", p, berr)

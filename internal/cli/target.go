@@ -51,7 +51,11 @@ func normalizeTargetConfig(cfg *Config) {
 		}
 	}
 	if shouldDeriveTargetWorkRoot(cfg) {
-		cfg.WorkRoot = defaultWorkRootForTarget(cfg.TargetOS, cfg.WindowsMode)
+		if isStaticProvider(cfg.Provider) && cfg.TargetOS == targetMacOS {
+			cfg.WorkRoot = path.Join("/Users", cfg.SSHUser, "crabbox")
+		} else {
+			cfg.WorkRoot = defaultWorkRootForTarget(cfg.TargetOS, cfg.WindowsMode)
+		}
 	}
 	if isStaticProvider(cfg.Provider) {
 		if cfg.Static.Port != "" && cfg.SSHPort == baseConfig().SSHPort {
@@ -304,6 +308,10 @@ func autoRouteStaticLease(cfg *Config, fs *flag.FlagSet, id string) error {
 	if flagWasSet(fs, "provider") && !isStaticProvider(cfg.Provider) {
 		return nil
 	}
+	authoritative := providerSelectionIsAuthoritativeRoute(*cfg)
+	if authoritative && !isStaticProvider(cfg.Provider) {
+		return nil
+	}
 	claim, hasClaim, err := staticLeaseClaim(id)
 	if err != nil {
 		return err
@@ -311,8 +319,8 @@ func autoRouteStaticLease(cfg *Config, fs *flag.FlagSet, id string) error {
 	if (!hasStaticPrefix || suffix == "") && !hasClaim {
 		return nil
 	}
-	if !flagWasSet(fs, "provider") {
-		cfg.Provider = staticProvider
+	if !flagWasSet(fs, "provider") && !authoritative {
+		setProviderSelection(cfg, staticProvider, providerSelectionLeaseContext)
 	}
 	if !isStaticProvider(cfg.Provider) {
 		return nil
@@ -383,9 +391,13 @@ func autoRouteExternalLeaseWithHints(cfg *Config, id string, routingExplicit, ta
 	}
 	if routingExplicit {
 		if !cfg.providerExplicit {
-			cfg.Provider = "external"
+			setProviderSelection(cfg, "external", providerSelectionFlag)
 		}
 		return restoreExternalLeaseTarget(cfg, targetExplicit, windowsModeExplicit)
+	}
+	authoritative := providerSelectionIsAuthoritativeRoute(*cfg)
+	if authoritative && !providerSelected {
+		return nil
 	}
 	if providerSelected && strings.TrimSpace(cfg.External.RoutingFile) != "" {
 		if !cfg.External.routingLoaded {
@@ -412,8 +424,8 @@ func autoRouteExternalLeaseWithHints(cfg *Config, id string, routingExplicit, ta
 		}
 		return err
 	}
-	if !cfg.providerExplicit {
-		cfg.Provider = "external"
+	if !cfg.providerExplicit && !authoritative {
+		setProviderSelection(cfg, "external", providerSelectionLeaseContext)
 	}
 	if err := loadExternalRoutingConfig(cfg, path, true); err != nil {
 		return err
@@ -499,7 +511,7 @@ func uniqueExternalLeaseClaim(identifier string, providerSelected bool) (leaseCl
 		return leaseClaim{}, false, err
 	}
 	if exists {
-		if exact.Provider != "external" {
+		if canonicalClaimProvider(exact.Provider) != "external" {
 			return leaseClaim{}, false, nil
 		}
 		return exact, true, nil
@@ -515,7 +527,7 @@ func uniqueExternalLeaseClaim(identifier string, providerSelected bool) (leaseCl
 			continue
 		}
 		matches = append(matches, claim)
-		if claim.Provider == "external" {
+		if canonicalClaimProvider(claim.Provider) == "external" {
 			externalMatches = append(externalMatches, claim)
 		}
 	}

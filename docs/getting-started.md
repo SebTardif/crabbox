@@ -24,13 +24,21 @@ crabbox --version
 crabbox doctor
 ```
 
-`crabbox doctor` prints one line per check. Local tool checks (`git`, `ssh`,
-`ssh-keygen`, `rsync`) should report `ok`. It is fine if the broker and provider
-checks fail for now - we configure those next.
+`crabbox doctor` prints one line per check. On a fresh install, its
+provider-neutral `git` check should report `ok`; provider-specific tool checks
+begin after you select a provider. Doctor reports `no provider selected`, keeps
+the compatibility metadata as `source=compiled_default selected=false`, and
+skips provider credential readiness without failing the command. Select a
+provider through config, `CRABBOX_PROVIDER`, or `--provider` before a lifecycle
+command. That selection is strict and can fail until its credentials are
+configured; run `crabbox providers recommend` to compare options.
 
 If you do not use Homebrew, GitHub Releases ship signed archives for macOS,
 Linux, and Windows. Download the matching archive from
 <https://github.com/openclaw/crabbox/releases>.
+Automatic WSL transport selection on Windows requires a build from current
+`main` or Crabbox v0.42.1 and newer. See the
+[supported Windows installation](windows-install.md) for the complete setup.
 
 ## Step 2. Log In
 

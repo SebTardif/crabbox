@@ -302,11 +302,72 @@ func TestCheckpointForkDryRunDoesNotAcquireLease(t *testing.T) {
 	}
 	var stdout bytes.Buffer
 	app := App{Stdout: &stdout, Stderr: io.Discard}
-	if err := app.checkpointFork(context.Background(), []string{record.ID, "--dry-run", "--slug", "fork-dryrun"}); err != nil {
+	if err := app.checkpointFork(context.Background(), []string{record.ID, "--provider", "local-container", "--dry-run", "--slug", "fork-dryrun"}); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(stdout.String(), "would fork checkpoint") || !strings.Contains(stdout.String(), "fork-dryrun") {
 		t.Fatalf("stdout=%q", stdout.String())
+	}
+}
+
+func TestCheckpointForkArchiveDryRunRequiresProviderIntent(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	t.Setenv("CRABBOX_CONFIG", filepath.Join(t.TempDir(), "missing.yaml"))
+	store, err := defaultCheckpointStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := store.Create(checkpointRecord{ID: "chk_fork_no_provider", Kind: checkpointKindArchive, CreatedAt: time.Now().UTC().Format(time.RFC3339)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = (App{Stdout: io.Discard, Stderr: io.Discard}).checkpointFork(context.Background(), []string{record.ID, "--dry-run"})
+	var exitErr ExitError
+	if !AsExitError(err, &exitErr) || exitErr.Code != 2 || exitErr.Message != providerSelectionRequiredDiagnostic {
+		t.Fatalf("error=%v, want exit 2 %q", err, providerSelectionRequiredDiagnostic)
+	}
+}
+
+func TestCheckpointForkNativeDryRunUsesRecordedProvider(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	t.Setenv("CRABBOX_CONFIG", filepath.Join(t.TempDir(), "missing.yaml"))
+	store, err := defaultCheckpointStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := checkpointRecord{ID: "chk_native_recorded_provider", Kind: checkpointKindDockerCommit, CreatedAt: time.Now().UTC().Format(time.RFC3339), TargetOS: targetLinux}
+	record.Native.ImageID = "sha256:checkpoint"
+	record.Native.Direct = true
+	if _, err := store.Create(record); err != nil {
+		t.Fatal(err)
+	}
+	var stdout bytes.Buffer
+	err = (App{Stdout: &stdout, Stderr: io.Discard}).checkpointFork(context.Background(), []string{record.ID, "--dry-run"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stdout.String(), "provider=local-container") {
+		t.Fatalf("stdout=%q", stdout.String())
+	}
+}
+
+func TestCheckpointForkParallelsTemplateDryRunConfigMarksProviderIntent(t *testing.T) {
+	clearConfigEnv(t)
+	t.Setenv("CRABBOX_CONFIG", filepath.Join(t.TempDir(), "missing.yaml"))
+	defaults := defaultConfig()
+	fs := newFlagSet("checkpoint fork parallels dry run", io.Discard)
+	leaseFlags := registerLeaseCreateFlags(fs, defaults)
+	_ = fs.String("parallels-template", "", "")
+	if err := parseFlags(fs, []string{"--parallels-template", "win"}); err != nil {
+		t.Fatal(err)
+	}
+	*leaseFlags.Provider = "parallels"
+	cfg, err := loadCheckpointForkParallelsConfig(fs, leaseFlags)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Provider != "parallels" || cfg.providerSelectionSource != providerSelectionFlag || !providerSelectionIsActionable(cfg) {
+		t.Fatalf("provider=%q source=%q", cfg.Provider, cfg.providerSelectionSource)
 	}
 }
 
@@ -324,7 +385,7 @@ func TestCheckpointForkDryRunFansOutRequestedSlug(t *testing.T) {
 
 	var stdout bytes.Buffer
 	app := App{Stdout: &stdout, Stderr: io.Discard}
-	if err := app.checkpointFork(context.Background(), []string{record.ID, "--dry-run", "--count", "3", "--slug", "Fork Smoke"}); err != nil {
+	if err := app.checkpointFork(context.Background(), []string{record.ID, "--provider", "local-container", "--dry-run", "--count", "3", "--slug", "Fork Smoke"}); err != nil {
 		t.Fatal(err)
 	}
 	out := stdout.String()
@@ -357,7 +418,7 @@ func TestCheckpointForkDryRunFansOutCommand(t *testing.T) {
 	var stdout bytes.Buffer
 	app := App{Stdout: &stdout, Stderr: io.Discard}
 	err = app.checkpointFork(context.Background(), []string{
-		record.ID, "--dry-run", "--count", "2", "--slug", "Fanout",
+		record.ID, "--provider", "local-container", "--dry-run", "--count", "2", "--slug", "Fanout",
 		"--", "pnpm", "test", "--", "--shard", "{{index}}/{{total}}", "--lease", "{{lease}}", "--slug", "{{slug}}",
 	})
 	if err != nil {
@@ -968,6 +1029,9 @@ func TestDirectAWSCheckpointConfigUsesDirectMarker(t *testing.T) {
 	}
 	if cfg.AWSRegion != "eu-west-1" {
 		t.Fatalf("AWSRegion=%q, want record region", cfg.AWSRegion)
+	}
+	if cfg.providerSelectionSource != providerSelectionRecordedRun {
+		t.Fatalf("provider source=%q want %q", cfg.providerSelectionSource, providerSelectionRecordedRun)
 	}
 
 	if err := os.WriteFile(cfgPath, []byte("provider: aws\ncoordinator: https://coordinator.example\naws:\n  region: us-east-1\n"), 0o600); err != nil {
@@ -1714,6 +1778,9 @@ func TestApplyAWSMacOSCheckpointForkConfigPreservesTypeWithoutHostPin(t *testing
 
 	if cfg.Provider != "aws" || cfg.TargetOS != targetMacOS || cfg.AWSSnapshot != "snap-000000000001" {
 		t.Fatalf("aws macOS snapshot config not applied: %#v", cfg)
+	}
+	if cfg.providerSelectionSource != providerSelectionRecordedRun {
+		t.Fatalf("provider source=%q want %q", cfg.providerSelectionSource, providerSelectionRecordedRun)
 	}
 	if cfg.HostID != "" || cfg.AWSMacHostID != "" {
 		t.Fatalf("host pin carried into fork: hostID=%q awsMacHostID=%q", cfg.HostID, cfg.AWSMacHostID)

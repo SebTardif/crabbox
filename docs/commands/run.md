@@ -38,7 +38,12 @@ snippets, pipes, or shell expansion.
 If `--id` is omitted, Crabbox creates a fresh, non-kept lease and releases it
 when the command exits. With `--id` it reuses an existing lease; `--id` accepts
 either the stable `cbx_...` ID or the active friendly slug (see
-[identifiers](../features/identifiers.md)).
+[identifiers](../features/identifiers.md)). When `--provider` is omitted, a
+provider-bearing local claim selects the existing lease's provider before that
+provider is configured. Exact lease IDs take precedence. Slug matches may span
+multiple scopes of one canonical provider, which that provider resolves; claims
+from different providers require a canonical ID or explicit provider. An
+explicit `--provider` remains authoritative.
 
 With `--pool <key>`, Crabbox borrows one hydrated broker ready-pool lease,
 uses the pool-recorded SSH endpoint, keeps the borrow deadline alive while it
@@ -159,11 +164,34 @@ common caches stay out. Default excludes also cover common generated churn such
 as `.ignored`, `.vite`, `playwright-report`, `test-results`, and local
 `.crabbox` log/capture directories.
 
+Jujutsu workspaces are supported for sync only when `.jj` is colocated with
+same-root `.git` metadata. Native Jujutsu revision mapping is not supported yet;
+`run` fails before lease acquisition or ready-pool borrowing instead of risking
+sync of an outer Git checkout's revision. Use a colocated Git workspace or pass
+`--no-sync` to run without transferring local files. See
+[sync](../features/sync.md#jujutsu-workspaces) for safe initialization guidance.
+
 Before the first rsync into a Git checkout, Crabbox seeds the remote worktree
 from your `origin` remote so the first sync is a dirty-tree overlay instead of a
 full source upload. Crabbox also records a local/remote sync fingerprint and
 skips rsync when the tracked commit, manifest, and dirty metadata have not
 changed.
+
+Existing SSH leases use one remote, lease-scoped workspace owner before Crabbox
+reads hydration state, Git metadata, or the sync fingerprint. The owner remains
+held through sync or fresh checkout, Actions hydration, the command, result and
+artifact collection, failure capture, and ready-pool scrub/return. Separate
+clients and `watch` iterations therefore cannot mutate or execute the same
+reused workspace concurrently. A contending client waits for a bounded interval
+and prints periodic progress. Newly acquired one-shot leases are already
+exclusive and bypass this owner.
+
+Ownership is fenced with a random token and renewed while the lifecycle is
+active. If the local client disappears, Crabbox recovers an expired owner only
+after verifying that its witnessed remote child is no longer alive. Ambiguous
+renewal, release, token, or child state fails closed instead of risking a
+concurrent checkout. POSIX, WSL2, and native Windows targets implement the same
+protocol; the small sync-finalization lock remains nested inside it.
 
 Use `--full-resync` (alias `--fresh-sync`) when a warm lease smells stale:
 Crabbox deletes the remote workdir, skips the fingerprint fast path, reseeds Git
@@ -213,6 +241,18 @@ or `--no-sync` is set. This preserves the setup the workflow performed:
 checkout path, installed dependencies, caches, runner temp/toolcache paths, and
 any project-specific preparation. See
 [Actions hydration](../features/actions-hydration.md).
+
+Standalone `crabbox actions hydrate --id ...` acquires the same remote workspace
+owner as ordinary reused runs, so hydration cannot overlap a sync, command,
+collection, or cleanup from another client.
+
+For an adopted Actions workspace, `--full-resync` invalidates the readiness
+marker before resetting the remote tree. A command-bearing run continues only
+when automatic local hydration can rebuild the canonical lease workspace; it
+otherwise fails before reset. Omit `--no-hydrate` and use the canonical
+workspace for the command path, or use `--sync-only` to reset and sync without
+rehydration or a user command. The full invalidation, reset, sync, hydration,
+and command sequence remains under the reusable workspace owner.
 
 If a JavaScript package-manager command (`pnpm`, `npm`, `node`, `corepack`)
 runs on a raw SSH workspace before a hydration marker exists and no automatic
@@ -266,11 +306,25 @@ page.
 
 ## Scripts
 
-Use `--script <file>` or `--script-stdin` for multi-line remote commands.
-Crabbox uploads the script into `.crabbox/scripts/` under the remote workdir,
-runs it as a file, and includes that script directory in failure bundles. A
-shebang is honored on POSIX targets; scripts without one run through `bash`.
-Native Windows targets run uploaded scripts through Windows PowerShell, and
+Use `--script <file>` or `--script-stdin` for multi-line remote commands. On
+POSIX SSH leases, Crabbox uploads a standalone, content-hashed copy into
+`.crabbox/scripts/` under the remote workdir and executes that copy with the
+workdir as its process PWD. `$0` identifies the generated upload path, so
+`dirname "$0"` resolves to `.crabbox/scripts/`, not the script's original local
+directory. That directory component is not preserved in the uploaded copy and
+cannot be recovered from `$0`. Standalone uploaded scripts should resolve
+synced project assets from `$PWD`.
+
+If a Git-managed script needs its synced repository path or adjacent assets,
+invoke it as trailing argv so the project copy runs in place:
+
+```sh
+crabbox run -- ./scripts/check.sh
+```
+
+Crabbox includes the uploaded script directory in failure bundles. A shebang is
+honored on POSIX targets; scripts without one run through `bash`. Native Windows
+targets run uploaded scripts through Windows PowerShell, and
 `--script-stdin` is treated as a PowerShell script; a non-`.ps1` script path
 gets a `.ps1` extension added before upload. Trailing arguments after `--` are
 passed to the script. This is an SSH-run feature for OS-backed providers.
@@ -314,31 +368,35 @@ or the command/script you run.
 
 By default it probes common language and infrastructure tools plus OS-specific
 basics. Default generic probes are `git`, `tar`, `node`, `npm`, `corepack`,
-`pnpm`, `yarn`, `bun`, and `docker`; `uv` is available as an additional built-in.
-POSIX/Linux/WSL probes also include `sudo`, `apt`, and `bubblewrap`; native
-Windows probes include `powershell`, `execution_policy`, `longpaths`, `temp`,
-and `pwsh`.
+`pnpm`, `yarn`, `bun`, and `docker`; `uv`, `python`, and `python3` are available
+as additional opt-in built-ins. POSIX/Linux/WSL probes also include `sudo`,
+`apt`, and `bubblewrap`; native Windows probes include `powershell`,
+`execution_policy`, `longpaths`, `temp`, and `pwsh`.
 
 Use `--preflight-tools` to replace the default tool list for one run:
 
 ```sh
 crabbox run --preflight --preflight-tools node,bun,docker -- bun test
 crabbox run --preflight --preflight-tools default,uv -- node --test
+crabbox run --preflight --preflight-tools python,python3 -- python3 -m pytest
 crabbox run --preflight --preflight-tools none -- ./smoke.sh
 ```
 
-`default` expands to the built-ins; `none` keeps only the workspace summary.
-Unknown tool names fail before leasing so typos do not hide missing
+`default` expands to the default probe list; `none` keeps only the workspace
+summary. Unknown tool names fail before leasing so typos do not hide missing
 diagnostics. Unsupported OS-specific probes are skipped for the current target.
+The Python probes always invoke the literal requested command with `--version`,
+including `python` and `python3` on native Windows; Crabbox does not map either
+name to `py`. An unavailable literal command prints `<name>=missing` and the run
+continues.
 
 Configure the default per repo:
 
 ```yaml
 run:
   preflightTools:
-    - node
-    - bun
-    - docker
+    - python
+    - python3
 ```
 
 ## Profiles, presets, and proof
@@ -355,7 +413,9 @@ Use `--emit-proof <path>` to render a Markdown `## Real behavior proof` block
 after a successful run, derived from run metadata, the expanded command,
 selected live console output, collected artifact paths, and the
 `--proof-template` or preset template. Keep proof templates in repo config so
-parser-sensitive PR wording stays project-owned.
+parser-sensitive PR wording stays project-owned. Default headings are
+context-neutral; put patch- or fix-specific claims in repository-owned template
+fields only when the run actually proves them.
 
 Use `--attest <path>` to write a signed run receipt after a successful run: a
 flat JSON record of the provider, lease, command, exit code, timing, and the
@@ -403,7 +463,10 @@ Use `--capture-stdout <path>` when stdout is binary or terminal-hostile. Crabbox
 writes the remote stdout bytes directly to the local file, leaves stderr on the
 terminal, and skips stdout run-log/event capture. `--capture-stderr <path>`
 works the same way for stderr. Both are SSH-run-only; delegated providers reject
-them.
+them. When `--emit-proof` is also set, the proof includes the safely escaped
+local capture path and final byte count for each redirected stream, but never
+reads or embeds the captured bytes. Any other live console output remains in
+the proof's redacted tail excerpt.
 
 When the remote command exits non-zero, Crabbox writes a local-only
 `.crabbox/captures/*.tar.gz` failure bundle by default. SSH-backed bundles
@@ -451,17 +514,23 @@ record.
 When a remote command exits non-zero, `run` prints a compact failure digest
 after the timing summary: the failed phase when phase markers are known, a
 likely area (provider auth, SSH/connectivity, sync, install/setup, user command,
-or model/tool/provider limit), retryability when inferable, next commands
+model/tool/provider limit, or resource exhaustion), retryability when inferable, next commands
 (`logs`, `events`, `doctor --from-run`, `ssh`, retrying with `--fresh-sync`, and
 `stop`), and a short redacted stdout/stderr tail. It does not reconstruct secrets
-or hidden local shell state.
+or hidden local shell state. When an SSH backend supplies per-run memory
+exhaustion evidence, the summary and digest use
+`blocked_stage=resource_exhaustion resource_exhaustion=memory retry_likely=false`
+and recommend increasing the memory limit or reducing workload concurrency.
+Evidence read failures are warnings and do not replace the original command
+failure.
 
 Use `--timing-json` to emit a final JSON timing record with provider, lease ID,
 slug, run ID, machine type, repo path, remote workdir, lease acquisition,
 bootstrap, sync phases, command phases, command duration, command-path total,
 end-to-end duration, exit code, normalized `runStatus`, optional `errorKind`,
 stop command, artifacts, and Actions run URL when available. Failed runs also
-include `blockedStage` and `retryLikely` when classifiable. Commands can emit
+include `blockedStage`, `resourceExhaustion`, and `retryLikely` when classifiable.
+Commands can emit
 phase markers on stdout or stderr as
 `CRABBOX_PHASE:<name>`; Crabbox records those as `commandPhases` without removing
 the marker line from output. In `blacksmith-testbox` mode, sync is reported as

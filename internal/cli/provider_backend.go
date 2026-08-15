@@ -126,6 +126,38 @@ type SSHLeaseBackend interface {
 	ReleaseLease(ctx context.Context, req ReleaseLeaseRequest) error
 }
 
+// SSHRunFailureEvidenceBackend optionally captures provider-owned state just
+// before an SSH command starts. The returned collector retains that baseline
+// inside the provider and returns only normalized evidence to core after a
+// command or transport failure.
+type SSHRunFailureEvidenceBackend interface {
+	Backend
+	BeginRunFailureEvidence(ctx context.Context, req RunFailureEvidenceRequest) (RunFailureEvidenceCollector, error)
+}
+
+type RunFailureEvidenceRequest struct {
+	Lease LeaseTarget
+}
+
+type RunFailureEvidenceCollector func(context.Context) (RunFailureEvidence, error)
+
+type RunFailureEvidence struct {
+	ResourceExhaustion ResourceExhaustionReason
+}
+
+type ResourceExhaustionReason string
+
+const (
+	ResourceExhaustionMemory ResourceExhaustionReason = "memory"
+)
+
+// ExclusiveOneShotAcquireBackend marks Acquire results that are newly
+// provisioned and exclusive to the caller until the one-shot run completes.
+// Backends are non-exclusive by default.
+type ExclusiveOneShotAcquireBackend interface {
+	AcquireIsExclusiveOneShot() bool
+}
+
 // StatusTouchClaimValidator lets a provider require identity labels that core
 // cannot interpret before status --wait extends a remotely visible lease.
 type StatusTouchClaimValidator interface {
@@ -237,6 +269,11 @@ type ReleaseLeaseClaimRetainer interface {
 	// Retained releases must persist terminal state and clear live endpoints
 	// before ReleaseLease returns.
 	RetainLeaseClaimAfterRelease(lease LeaseTarget) bool
+}
+
+type ReleaseLeaseClaimRetentionVerifier interface {
+	// An error leaves claim state untouched so uncertain ownership fails closed.
+	RetainLeaseClaimAfterReleaseWithClaim(lease LeaseTarget, previous LeaseClaim) (bool, error)
 }
 
 type NativeCheckpointCapability struct {
@@ -1069,7 +1106,7 @@ func normalizeProviderName(name string) string {
 }
 
 func providerHelpAll() string {
-	return "provider: " + strings.Join(providerNamesForHelp(nil), ", ")
+	return "provider: " + strings.Join(providerNamesForHelp(nil), ", ") + " (defaults to configured selection)"
 }
 
 func providerHelpEnvValues() string {
@@ -1090,13 +1127,13 @@ func joinProviderNames(names []string) string {
 func providerHelpSSH() string {
 	return "provider: " + strings.Join(providerNamesForHelp(func(spec ProviderSpec) bool {
 		return spec.Features.Has(FeatureSSH)
-	}), ", ")
+	}), ", ") + " (defaults to configured selection)"
 }
 
 func providerHelpCleanup() string {
 	return "provider: " + joinProviderNames(providerNamesForHelp(func(spec ProviderSpec) bool {
 		return spec.Features.Has(FeatureCleanup)
-	}))
+	})) + " (defaults to configured selection)"
 }
 
 func isBlacksmithProvider(provider string) bool {
@@ -1134,8 +1171,11 @@ func applyProviderRoutingFlags(cfg *Config, fs *flag.FlagSet, values providerFla
 	if err != nil {
 		return err
 	}
+	cfg.Provider = provider.Name()
+	if providerSelectionIsAuthoritativeRoute(*cfg) {
+		return nil
+	}
 	if router, ok := provider.(ProviderRouter); ok {
-		cfg.Provider = provider.Name()
 		if err := router.RouteConfig(cfg, fs, values[provider.Name()]); err != nil {
 			return err
 		}
@@ -1149,6 +1189,7 @@ func applyProviderRoutingFlags(cfg *Config, fs *flag.FlagSet, values providerFla
 func applyProviderFlags(cfg *Config, fs *flag.FlagSet, values providerFlagValues) error {
 	if flagWasSet(fs, "provider") {
 		cfg.providerExplicit = true
+		cfg.providerSelectionSource = providerSelectionFlag
 	}
 	if _, err := routeProviderFlagOverride(cfg, fs, values); err != nil {
 		return err
@@ -1222,7 +1263,7 @@ func routeProviderFlagOverride(cfg *Config, fs *flag.FlagSet, values providerFla
 		if !ok {
 			continue
 		}
-		cfg.Provider = candidate.Name()
+		setProviderSelection(cfg, candidate.Name(), providerSelectionFlag)
 		if err := router.RouteConfig(cfg, fs, values[candidate.Name()]); err != nil {
 			return true, err
 		}
@@ -1254,6 +1295,9 @@ func routeConfiguredProvider(cfg *Config) error {
 		return err
 	}
 	cfg.Provider = provider.Name()
+	if providerSelectionIsAuthoritativeRoute(*cfg) {
+		return nil
+	}
 	if router, ok := provider.(ProviderRouter); ok {
 		if err := router.RouteConfig(cfg, nil, nil); err != nil {
 			return err
@@ -1331,6 +1375,9 @@ func validateControllerCoordinatorRegistrationBinding(cfg Config) error {
 }
 
 func loadBackend(cfg Config, rt Runtime) (Backend, error) {
+	if !providerSelectionIsActionable(cfg) {
+		return nil, exit(2, "%s", providerSelectionRequiredDiagnostic)
+	}
 	if rt.Stdout == nil {
 		rt.Stdout = io.Discard
 	}

@@ -579,8 +579,8 @@ provider: apple-vm
 appleVM:
   # Optional for normal Homebrew/release installs.
   helperPath: /custom/path/crabbox-apple-vm-helper
-  image: https://cloud-images.ubuntu.com/releases/resolute/release-20260520/ubuntu-26.04-server-cloudimg-arm64.img
-  imageSHA256: 5e091e27d60116efbb0c743b8dd5cb2d15618e414ef04db0817ed43c8e2d7c7b
+  image: https://cloud-images.ubuntu.com/releases/resolute/release-20260731/ubuntu-26.04-server-cloudimg-arm64.img
+  imageSHA256: 3e113fdd41f39e13729375173bb2ae793f87dc6db4294e5251ff2476971788ba
   user: crabbox
   workRoot: /work/crabbox
   cpus: 4
@@ -962,14 +962,14 @@ list, and explicit `--allow-env` flags append afterward. See
 ```yaml
 run:
   preflightTools:
-    - node
-    - bun
-    - docker
+    - python
+    - python3
 ```
 
 `run.preflightTools` configures which built-in probes `crabbox run --preflight`
 executes before the remote command. The CLI flag
-`--preflight-tools node,bun,docker` overrides this list for one run. Use
+`--preflight-tools python,python3` overrides this list for one run. Both names
+are opt-in and probe the corresponding literal command with `--version`. Use
 `default` to include Crabbox's default built-ins and `none` to print only the
 workspace summary. Preflight probes only report availability; they do not
 install toolchains or mutate the machine.

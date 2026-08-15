@@ -14,6 +14,7 @@ crabbox warmup --provider azure --arch arm64 --class fast
 crabbox warmup --browser
 crabbox warmup --tailscale
 crabbox warmup --slug update-flow-smoke
+crabbox warmup --provider aws --lease-id cbx_abcdef123456 --slug update-flow-smoke
 crabbox warmup --pond alpha --slug db
 crabbox warmup --provider aws --target windows --desktop
 crabbox warmup --provider azure --target windows
@@ -44,6 +45,19 @@ stderr.
 Warmup records a local claim binding the lease to the current repo checkout. Use
 `--reclaim` to overwrite an existing claim for that lease.
 
+Warmup requires an explicit provider selection from `--provider`,
+`CRABBOX_PROVIDER`, user or repository config, broker config, or an applicable
+recorded lease route. With no selection it exits before provider initialization
+and points to `crabbox providers recommend`.
+
+For `local-container`, the default `--keep=true` also covers SSH readiness
+failure: once Docker has returned an exact container identity, Crabbox persists
+a scoped `provisioning` claim before inspecting the container or waiting for
+SSH. Cancellation or timeout retains that pending lease and prints exact
+inspect, reclaim, and cleanup commands.
+`warmup --keep=false` rolls the container and all per-lease local state back
+instead.
+
 ## Lifetime: TTL and idle timeout
 
 - `--ttl <duration>` is the maximum wall-clock lifetime. Default `90m`.
@@ -54,6 +68,30 @@ Warmup records a local claim binding the lease to the current repo checkout. Use
 
 `--slug <slug>` requests a human-chosen slug for a new lease. Crabbox normalizes
 it and may append a short suffix if an active lease already uses that slug.
+
+`--lease-id cbx_<12 lowercase hex>` is the automation idempotency contract for
+providers that explicitly support fixed identities. Direct AWS and managed
+coordinator leases accept it. Replaying the same normalized create intent
+returns or joins the same lease, including after the creating process loses its
+response. Reusing the ID with a different provider, slug request, SSH key,
+machine shape, capabilities, lifetime, or other immutable create input fails
+with `lease_id_conflict` before another provider create. Slugs remain display
+aliases and are never used as the idempotency key.
+
+Coordinator-backed fixed-ID creation uses a versioned `PUT /v1/leases/<id>`
+route. An older coordinator therefore rejects the request before provisioning;
+the CLI never falls back to slug lookup or legacy create behavior. After an
+ambiguous fixed create response, the CLI repeats that exact PUT to atomically
+confirm the same intent before it may poll lease status with GET.
+
+A fixed lease ID is single-use. If direct AWS acquisition completed and its
+bound instance later disappears, replay fails closed instead of relying on EC2
+client-token retention. Successful stop and missing-resource cleanup replace
+the live local claim with a compact terminal tombstone, so the ID remains
+rejected after release. Use a new operation ID for every later lease.
+If an AWS launch attempt was durably recorded but its instance is not yet
+visible, replay fails closed without resubmitting it; retry later to adopt the
+resource after provider inventory converges.
 
 `--pond <name>` tags a new lease into a named pond (stored as a reserved
 provider label); `crabbox list --pond <name>` filters by it. When combined with
@@ -251,7 +289,7 @@ warmup, because it also dispatches the workflow and waits for the ready marker.
 ## Flags
 
 ```text
---provider <name>                  provider (see crabbox providers); default hetzner
+--provider <name>                  provider (see crabbox providers); defaults to configured selection
 --profile <name>                   configuration profile
 --class <name>                     machine class; default beast
 --arch amd64|arm64                 CPU architecture; arm64 supports Linux on AWS/Azure/Apple Container and native Windows on Azure
@@ -259,6 +297,7 @@ warmup, because it also dispatches the workflow and waits for the ready marker.
 --type <provider-type>             provider server/instance type
 --market spot|on-demand            capacity market (AWS)
 --slug <slug>                      request a friendly slug for a new lease
+--lease-id cbx_<12 lowercase hex> fixed lease ID for idempotent automation
 --pond <name>                      tag this lease into a pond
 --expose <port>                    declare a TCP port reachable over the SSH-mesh plane; repeatable
 --cache-volume [name=]key:path     require a provider-backed cache volume; repeatable

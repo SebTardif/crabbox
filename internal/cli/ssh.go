@@ -441,6 +441,7 @@ func runSSHQuietWithOptions(ctx context.Context, target SSHTarget, remote, conne
 }
 
 func runSSHQuietWithOptionsResolvePort(ctx context.Context, target *SSHTarget, remote, connectTimeout, connectionAttempts string) error {
+	remote = wrapWorkspaceOwnerRemote(ctx, remote, false)
 	remote = wrapRemoteForTarget(*target, remote)
 	var lastErr error
 	for _, port := range sshPortCandidates(target.Port, target.FallbackPorts) {
@@ -462,6 +463,7 @@ func runSSHQuietWithOptionsResolvePort(ctx context.Context, target *SSHTarget, r
 }
 
 func runSSHQuietWithRemoteWaitTimeout(ctx context.Context, target SSHTarget, remote string, waitTimeout time.Duration, connectTimeout, connectionAttempts string) error {
+	remote = wrapWorkspaceOwnerRemote(ctx, remote, false)
 	remote = wrapRemoteForTargetWithWaitTimeout(target, remote, waitTimeout)
 	var lastErr error
 	for _, port := range sshPortCandidates(target.Port, target.FallbackPorts) {
@@ -482,6 +484,7 @@ func runSSHQuietWithRemoteWaitTimeout(ctx context.Context, target SSHTarget, rem
 }
 
 func runSSHOutput(ctx context.Context, target SSHTarget, remote string) (string, error) {
+	remote = wrapWorkspaceOwnerRemote(ctx, remote, false)
 	remote = wrapRemoteForTarget(target, remote)
 	var lastOut []byte
 	var lastErr error
@@ -504,6 +507,7 @@ func runSSHOutput(ctx context.Context, target SSHTarget, remote string) (string,
 }
 
 func runSSHOutputWithRemoteWaitTimeout(ctx context.Context, target SSHTarget, remote string, waitTimeout time.Duration, connectTimeout, connectionAttempts string) (string, error) {
+	remote = wrapWorkspaceOwnerRemote(ctx, remote, false)
 	remote = wrapRemoteForTargetWithWaitTimeout(target, remote, waitTimeout)
 	var lastOut []byte
 	var lastErr error
@@ -527,6 +531,7 @@ func runSSHOutputWithRemoteWaitTimeout(ctx context.Context, target SSHTarget, re
 }
 
 func runSSHCombinedOutput(ctx context.Context, target SSHTarget, remote string) (string, error) {
+	remote = wrapWorkspaceOwnerRemote(ctx, remote, false)
 	remote = wrapRemoteForTarget(target, remote)
 	var lastOut []byte
 	var lastErr error
@@ -551,7 +556,27 @@ func runSSHCombinedOutput(ctx context.Context, target SSHTarget, remote string) 
 	return strings.TrimSpace(string(lastOut)), lastErr
 }
 
+var idempotentSSHRetryDelay = 2 * time.Second
+
+func runIdempotentSSHCombinedOutput(ctx context.Context, target SSHTarget, remote string, retryDelay time.Duration) (string, error) {
+	var lastOut string
+	var lastErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		lastOut, lastErr = runSSHCombinedOutput(ctx, target, remote)
+		if lastErr == nil || !shouldRetrySSHPort(lastErr) || attempt == 1 {
+			return lastOut, lastErr
+		}
+		// Only callers whose entire remote command is safe to repeat may use
+		// this helper. Transfer, hydration, and user commands stay outside it.
+		if err := sleepContext(ctx, retryDelay); err != nil {
+			return lastOut, err
+		}
+	}
+	return lastOut, lastErr
+}
+
 func runWSL2ControlScriptCombinedOutput(ctx context.Context, target SSHTarget, remote string, waitTimeout time.Duration, connectTimeout, connectionAttempts string) (string, error) {
+	remote = wrapWorkspaceOwnerRemote(ctx, remote, false)
 	command := wsl2StdinScriptCommandWithWaitTimeout(waitTimeout)
 	var lastOut []byte
 	var lastErr error
@@ -580,6 +605,7 @@ func runSSHInputQuiet(ctx context.Context, target SSHTarget, remote, input strin
 }
 
 func runSSHInput(ctx context.Context, target SSHTarget, remote string, input io.Reader, stdout, stderr io.Writer) error {
+	remote = wrapWorkspaceOwnerRemote(ctx, remote, true)
 	remote = wrapRemoteForTarget(target, remote)
 	if input == nil {
 		input = strings.NewReader("")
@@ -607,6 +633,7 @@ func runSSHInput(ctx context.Context, target SSHTarget, remote string, input io.
 }
 
 func runSSHInputStream(ctx context.Context, target SSHTarget, remote string, input io.ReadSeeker, stdout, stderr io.Writer) error {
+	remote = wrapWorkspaceOwnerRemote(ctx, remote, true)
 	remote = wrapRemoteForTarget(target, remote)
 	if input == nil {
 		input = strings.NewReader("")
@@ -638,6 +665,7 @@ func runSSHStream(ctx context.Context, target SSHTarget, remote string, stdout, 
 }
 
 func runSSHStreamResult(ctx context.Context, target SSHTarget, remote string, stdout, stderr io.Writer) (int, error) {
+	remote = wrapWorkspaceOwnerRemote(ctx, remote, false)
 	remote = wrapRemoteForTarget(target, remote)
 	lastCode := 7
 	var lastErr error
@@ -849,6 +877,21 @@ func rsync(ctx context.Context, target SSHTarget, src, dst string, excludes []st
 		ctx, cancel = context.WithTimeout(ctx, opts.Timeout)
 		defer cancel()
 	}
+	owner := workspaceOwnerFromContext(ctx)
+	guardStarted := false
+	if owner != nil && !isWindowsNativeTarget(target) {
+		rawCtx := contextWithoutWorkspaceOwner(ctx)
+		if err := runSSHQuiet(rawCtx, target, owner.rsyncPrepareCommand()); err != nil {
+			return exit(7, "prepare rsync workspace witness: %v", err)
+		}
+		if _, err := runSSHOutput(rawCtx, target, owner.WrapBackgroundCommand(owner.rsyncGuardPayload(dst))); err != nil {
+			return exit(7, "start rsync workspace witness: %v", err)
+		}
+		if err := owner.WaitForChild(rawCtx, 10*time.Second); err != nil {
+			return err
+		}
+		guardStarted = true
+	}
 	args := []string{
 		"-az",
 		"-e", strings.Join(shellWords(append([]string{"ssh"}, sshBaseArgs(target)...)), " "),
@@ -893,6 +936,22 @@ func rsync(ctx context.Context, target SSHTarget, src, dst string, excludes []st
 	stopHeartbeat := startSyncHeartbeat(stderr, start, opts.HeartbeatInterval)
 	err := cmd.Run()
 	stopHeartbeat()
+	if guardStarted {
+		guardCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 20*time.Second)
+		rawGuardCtx := contextWithoutWorkspaceOwner(guardCtx)
+		guardErr := runSSHQuiet(rawGuardCtx, target, owner.rsyncStopCommand())
+		if guardErr == nil {
+			guardErr = waitWorkspaceOwnerNoChild(rawGuardCtx, owner, 15*time.Second)
+		}
+		cleanupErr := runSSHQuiet(rawGuardCtx, target, owner.rsyncPrepareCommand())
+		cancel()
+		if guardErr == nil {
+			guardErr = cleanupErr
+		}
+		if guardErr != nil && err == nil {
+			err = exit(7, "finish rsync workspace witness: %v", guardErr)
+		}
+	}
 	if ctx.Err() == context.DeadlineExceeded {
 		return exit(6, "rsync timed out after %s; next_action=retry with --full-resync, then use a fresh lease if sync still stalls", opts.Timeout)
 	}
@@ -1154,10 +1213,15 @@ func windowsWSLHasNativeRsyncSSH(ctx context.Context, target SSHTarget, wslExe s
 	if strings.TrimSpace(wslExe) == "" {
 		return false
 	}
-	cmd := exec.CommandContext(ctx, wslExe, "sh", "-c", "rsync_path=$(command -v rsync) || exit 1; ssh_path=$(command -v ssh) || exit 1; printf '%s\\n%s\\n' \"$rsync_path\" \"$ssh_path\"")
+	cmd := windowsWSLNativeToolProbeCommand(ctx, wslExe)
 	applyTargetChildEnvironment(cmd, target)
 	out, err := cmd.Output()
 	return err == nil && windowsWSLNativeToolPaths(string(out))
+}
+
+func windowsWSLNativeToolProbeCommand(ctx context.Context, wslExe string) *exec.Cmd {
+	// Direct command output is intentional: assignment plus printf produced blank lines on real Windows/WSL systems.
+	return exec.CommandContext(ctx, wslExe, "sh", "-c", "command -v rsync || exit 1; command -v ssh || exit 1")
 }
 
 func windowsWSLNativeToolPaths(output string) bool {
@@ -1455,14 +1519,50 @@ func remoteResetWorkdir(workdir string) string {
 	return "bash -lc " + shellQuote(script)
 }
 
+func remoteGitWorkspaceFunctions() string {
+	return `exact_git_root() {
+  git_root="$(git rev-parse --show-toplevel 2>/dev/null)" || return 1
+  git_root="$(cd -P -- "$git_root" 2>/dev/null && pwd -P)" || return 1
+  [ "$git_root" = "$(pwd -P)" ]
+}
+usable_git_workspace() (
+  exact_git_root || exit 1
+  git rev-parse --verify HEAD^{commit} >/dev/null 2>&1 || exit 1
+  workspace_index="$(git rev-parse --git-path index 2>/dev/null)" || exit 1
+  case "$workspace_index" in /*) ;; *) workspace_index="$PWD/$workspace_index" ;; esac
+  [ -f "$workspace_index" ] || exit 1
+  workspace_tree="$(git write-tree 2>/dev/null)" || exit 1
+  [ -n "$workspace_tree" ]
+)
+normalize_git_remote() {
+  case "$1" in
+    git@github.com:*) remote_path="${1#git@github.com:}"; remote_path="${remote_path%.git}"; printf 'https://github.com/%s.git' "$remote_path" ;;
+    *) printf %s "$1" ;;
+  esac
+}
+origin_matches() {
+  actual_origin="$(git remote get-url origin 2>/dev/null)" || return 1
+  [ "$(normalize_git_remote "$actual_origin")" = "$expected_origin" ]
+}
+repair_origin() {
+  if git remote get-url origin >/dev/null 2>&1; then
+    git remote set-url origin "$expected_origin" >/dev/null 2>&1
+  else
+    git remote add origin "$expected_origin" >/dev/null 2>&1
+  fi && origin_matches
+}
+`
+}
+
 func remoteGitHydrateStatus(workdir, baseRef, expectedSHA string) string {
 	if baseRef == "" || expectedSHA == "" {
 		return "printf ''"
 	}
-	script := `cd ` + shellQuote(workdir) + ` && ` + remoteSyncMetaDirScript() + `
-if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+	script := `cd ` + shellQuote(workdir) + ` && ` + remoteGitWorkspaceFunctions() + `
+if ! exact_git_root; then
   exit 0
 fi
+` + remoteSyncMetaDirScript() + `
 marker="$meta_dir/git-hydrate-base"
 remote_sha="$(git rev-parse --verify ` + shellQuote("refs/remotes/origin/"+baseRef+"^{commit}") + ` 2>/dev/null || git rev-parse --verify ` + shellQuote("origin/"+baseRef+"^{commit}") + ` 2>/dev/null || true)"
 if [ "$remote_sha" = ` + shellQuote(expectedSHA) + ` ]; then
@@ -1479,21 +1579,42 @@ fi`
 	return "bash -lc " + shellQuote(script)
 }
 
-func remoteGitSeed(workdir, remoteURL, head string) string {
-	remoteURL = normalizeGitRemoteURL(remoteURL)
-	if remoteURL == "" || head == "" {
+func remoteGitSeed(workdir string, plan gitCoherencePlan) string {
+	if !plan.seedEnabled() {
 		return "true"
 	}
 	parent := filepath.ToSlash(filepath.Dir(workdir))
-	return "if [ ! -d " + shellQuote(workdir+"/.git") + " ]; then " +
-		"mkdir -p " + shellQuote(parent) + "; " +
-		"tmp=$(mktemp -d " + shellQuote(parent+"/.seed.XXXXXX") + "); " +
-		"if git clone --quiet --filter=blob:none --no-checkout " + shellQuote(remoteURL) + " \"$tmp\" >/dev/null 2>&1; then " +
-		"if (cd \"$tmp\" && (git fetch --quiet --depth=1 origin " + shellQuote(head) + " || true) && (git checkout --quiet " + shellQuote(head) + " || git checkout --quiet FETCH_HEAD)); then " +
-		"rm -rf " + shellQuote(workdir) + " && mv \"$tmp\" " + shellQuote(workdir) + "; " +
-		"else rm -rf \"$tmp\"; fi; " +
-		"else rm -rf \"$tmp\"; fi; " +
-		"fi"
+	script := `set -e
+workdir=` + shellQuote(workdir) + `
+expected_origin=` + shellQuote(plan.RemoteURL) + `
+expected_tree=` + shellQuote(plan.Tree) + `
+` + remoteGitWorkspaceFunctions() + `
+if [ -d "$workdir" ]; then
+  cd "$workdir"
+  if usable_git_workspace; then
+    repair_origin
+    exit 0
+  fi
+fi
+mkdir -p ` + shellQuote(parent) + `
+tmp="$(mktemp -d ` + shellQuote(parent+"/.seed.XXXXXX") + `)"
+cleanup_seed() { rm -rf -- "$tmp"; }
+trap cleanup_seed EXIT
+git clone --quiet --filter=blob:none --no-checkout --single-branch --branch ` + shellQuote(plan.Branch) + ` "$expected_origin" "$tmp" >/dev/null 2>&1
+git -C "$tmp" checkout --quiet --detach ` + shellQuote(plan.Target) + `
+[ "$(git -C "$tmp" rev-parse --verify HEAD^{commit})" = ` + shellQuote(plan.Target) + ` ]
+cd "$tmp"
+usable_git_workspace
+if [ -n "$expected_tree" ]; then
+  [ "$(git write-tree)" = "$expected_tree" ]
+fi
+repair_origin
+cd /
+rm -rf -- "$workdir"
+mv -- "$tmp" "$workdir"
+trap - EXIT
+`
+	return "bash -lc " + shellQuote(script)
 }
 
 func normalizeGitRemoteURL(remoteURL string) string {
@@ -1506,8 +1627,35 @@ func normalizeGitRemoteURL(remoteURL string) string {
 	return remoteURL
 }
 
-func remoteReadSyncFingerprint(workdir string) string {
-	script := "cd " + shellQuote(workdir) + " && " + remoteSyncMetaDirScript() + "cat \"$meta_dir/sync-fingerprint\" 2>/dev/null || true"
+func remoteReadSyncFingerprint(workdir string, plan gitCoherencePlan) string {
+	if !plan.enabled() {
+		return "printf ''"
+	}
+	script := "cd " + shellQuote(workdir) + " && " + `expected_origin=` + shellQuote(plan.RemoteURL) + `
+` + remoteGitWorkspaceFunctions() + `
+if ! exact_git_root || ! origin_matches; then
+  exit 0
+fi
+` + remoteSyncMetaDirScript() + `
+committed="$meta_dir/sync-finalize-token"
+complete="$meta_dir/sync-finalize-complete-token"
+if [ -f "$committed" ] && [ -f "$complete" ] &&
+   [ "$(cat "$committed")" = "$(cat "$complete")" ] &&
+   [ "$(git rev-parse --verify HEAD^{commit} 2>/dev/null || true)" = ` + shellQuote(plan.Target) + ` ] &&
+   [ "$(git write-tree 2>/dev/null || true)" = ` + shellQuote(plan.Tree) + ` ]; then
+  cat "$meta_dir/sync-fingerprint" 2>/dev/null || true
+fi`
+	return "bash -lc " + shellQuote(script)
+}
+
+func remoteInvalidateSyncFingerprintForTarget(target SSHTarget, workdir string) string {
+	if isWindowsNativeTarget(target) {
+		return powershellCommand("exit 0")
+	}
+	script := `set -e
+cd ` + shellQuote(workdir) + `
+` + remoteSyncMetaDirScript() + `
+rm -f "$meta_dir/sync-fingerprint"`
 	return "bash -lc " + shellQuote(script)
 }
 
@@ -1517,6 +1665,16 @@ type remoteSyncFinalizeOptions struct {
 	BaseRef            string
 	BaseSHA            string
 	Fingerprint        string
+	Token              string
+	Coherence          gitCoherencePlan
+}
+
+func remoteSyncPendingManifestName(token string) string {
+	return "sync-manifest." + token + ".new"
+}
+
+func remoteSyncPendingDeletedName(token string) string {
+	return "sync-deleted." + token + ".new"
 }
 
 func remoteWriteSyncManifestNew(workdir string) string {
@@ -1539,8 +1697,11 @@ func remoteSyncInterpreterCommand(python, perl, args string) string {
 		"; else echo " + shellQuote("missing required sync interpreter: need python3, python, or perl") + " >&2; exit 127; fi"
 }
 
-func remoteWriteSyncManifestsNew(workdir string) string {
+func remoteWriteSyncManifestsNew(workdir, finalizeToken string) string {
+	manifestName := remoteSyncPendingManifestName(finalizeToken)
+	deletedName := remoteSyncPendingDeletedName(finalizeToken)
 	script := "set -e\nmkdir -p " + shellQuote(workdir) + "\ncd " + shellQuote(workdir) + "\n" + remoteSyncMetaDirScript() + `mkdir -p "$meta_dir"
+` + remoteSyncAbandonedMetadataCleanup() + `
 IFS= read -r manifest_len
 case "$manifest_len" in
   ''|*[!0-9]*) echo "invalid sync manifest length" >&2; exit 1 ;;
@@ -1548,8 +1709,8 @@ esac
 # Keep this to POSIX dd operands: minimal guests commonly provide BusyBox dd,
 # which rejects GNU's progress-suppression extension. Suppress only the summary;
 # dd's exit status still makes the fail-closed script abort on a short write.
-dd bs=1 count="$manifest_len" of="$meta_dir/sync-manifest.new" 2>/dev/null
-cat > "$meta_dir/sync-deleted.new"
+dd bs=1 count="$manifest_len" of="$meta_dir/` + manifestName + `" 2>/dev/null
+cat > "$meta_dir/` + deletedName + `"
 `
 	return "bash -lc " + shellQuote(script)
 }
@@ -1563,14 +1724,16 @@ func syncManifestInputForTarget(target SSHTarget, manifestData, deletedData []by
 	return fmt.Sprintf("%d\n", len(manifestData)) + string(manifestData) + string(deletedData)
 }
 
-func remoteWriteSyncManifestsNewForTarget(target SSHTarget, workdir string) string {
+func remoteWriteSyncManifestsNewForTarget(target SSHTarget, workdir, finalizeToken string) string {
 	if isWindowsWSL2Target(target) {
-		return remoteWriteSyncManifestsNewPython(workdir)
+		return remoteWriteSyncManifestsNewPython(workdir, finalizeToken)
 	}
-	return remoteWriteSyncManifestsNew(workdir)
+	return remoteWriteSyncManifestsNew(workdir, finalizeToken)
 }
 
-func remoteWriteSyncManifestsNewPython(workdir string) string {
+func remoteWriteSyncManifestsNewPython(workdir, finalizeToken string) string {
+	manifestName := remoteSyncPendingManifestName(finalizeToken)
+	deletedName := remoteSyncPendingDeletedName(finalizeToken)
 	python := `import base64
 import sys
 
@@ -1598,15 +1761,21 @@ with open(sys.argv[2], "wb") as handle:
     handle.write(deleted)
 `
 	script := "set -e\nmkdir -p " + shellQuote(workdir) + "\ncd " + shellQuote(workdir) + "\n" + remoteSyncMetaDirScript() + "mkdir -p \"$meta_dir\"\n" +
-		"python3 -c " + shellQuote(python) + " \"$meta_dir/sync-manifest.new\" \"$meta_dir/sync-deleted.new\"\n"
+		remoteSyncAbandonedMetadataCleanup() + "\n" +
+		"python3 -c " + shellQuote(python) + " \"$meta_dir/" + manifestName + "\" \"$meta_dir/" + deletedName + "\"\n"
 	return "bash -lc " + shellQuote(script)
+}
+
+func remoteSyncAbandonedMetadataCleanup() string {
+	return `find "$meta_dir" -type f \( -name 'sync-manifest.new' -o -name 'sync-deleted.new' -o -name 'sync-manifest.*.new' -o -name 'sync-deleted.*.new' -o -name 'sync-manifest.*.sorted' -o -name 'sync-finalize-token.tmp.*' -o -name 'sync-finalize-complete-token.tmp.*' -o -name 'sync-git-status.*' \) -mtime +7 -exec rm -f -- {} \; 2>/dev/null || true`
 }
 
 func remoteSeedSyncManifestFromGit(workdir string) string {
 	script := "set -e\ncd " + shellQuote(workdir) + `
+` + remoteGitWorkspaceFunctions() + `
 ` + remoteSyncMetaDirScript() + `
 old="$meta_dir/sync-manifest"
-if [ ! -f "$old" ] && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+if [ ! -f "$old" ] && exact_git_root; then
   mkdir -p "$meta_dir"
   git ls-files -z > "$old"
 fi
@@ -1614,7 +1783,9 @@ fi
 	return "bash -lc " + shellQuote(script)
 }
 
-func remotePruneSyncManifest(workdir string) string {
+func remotePruneSyncManifest(workdir, finalizeToken string) string {
+	manifestName := remoteSyncPendingManifestName(finalizeToken)
+	deletedName := remoteSyncPendingDeletedName(finalizeToken)
 	python := `import sys
 
 def read_manifest(path):
@@ -1649,8 +1820,8 @@ print STDOUT map { $_ . "\0" } grep { !$new{$_} } @old;
 	script := "set -e -o pipefail\ncd " + shellQuote(workdir) + `
 ` + remoteSyncMetaDirScript() + `
 old="$meta_dir/sync-manifest"
-new="$meta_dir/sync-manifest.new"
-deleted="$meta_dir/sync-deleted.new"
+new="$meta_dir/` + manifestName + `"
+deleted="$meta_dir/` + deletedName + `"
 delete_paths() {
   while IFS= read -r -d '' rel; do
     case "$rel" in ''|/*|../*|*/../*) continue ;; esac
@@ -1671,19 +1842,21 @@ if [ -f "$old" ] && [ -f "$new" ]; then manifest_removed_paths | delete_paths; f
 	return "bash -lc " + shellQuote(script)
 }
 
-func remotePruneSyncManifestForTarget(target SSHTarget, workdir string) string {
+func remotePruneSyncManifestForTarget(target SSHTarget, workdir, finalizeToken string) string {
 	if isWindowsWSL2Target(target) {
-		return remotePruneSyncManifestCoreutils(workdir)
+		return remotePruneSyncManifestCoreutils(workdir, finalizeToken)
 	}
-	return remotePruneSyncManifest(workdir)
+	return remotePruneSyncManifest(workdir, finalizeToken)
 }
 
-func remotePruneSyncManifestCoreutils(workdir string) string {
+func remotePruneSyncManifestCoreutils(workdir, finalizeToken string) string {
+	manifestName := remoteSyncPendingManifestName(finalizeToken)
+	deletedName := remoteSyncPendingDeletedName(finalizeToken)
 	script := "set -e -o pipefail\ncd " + shellQuote(workdir) + `
 ` + remoteSyncMetaDirScript() + `
 old="$meta_dir/sync-manifest"
-new="$meta_dir/sync-manifest.new"
-deleted="$meta_dir/sync-deleted.new"
+new="$meta_dir/` + manifestName + `"
+deleted="$meta_dir/` + deletedName + `"
 delete_paths() {
   while IFS= read -r -d '' rel; do
     case "$rel" in ''|/*|../*|*/../*) continue ;; esac
@@ -1697,12 +1870,17 @@ delete_paths() {
 }
 if [ -f "$deleted" ]; then delete_paths < "$deleted"; fi
 if [ -f "$old" ] && [ -f "$new" ]; then
-  old_sorted="$meta_dir/sync-manifest.old.sorted"
-  new_sorted="$meta_dir/sync-manifest.new.sorted"
+  old_sorted="$meta_dir/sync-manifest.` + finalizeToken + `.old.sorted"
+  new_sorted="$meta_dir/sync-manifest.` + finalizeToken + `.new.sorted"
+  cleanup_sorted_manifests() {
+    rm -f "$old_sorted" "$new_sorted"
+  }
+  trap cleanup_sorted_manifests EXIT
   LC_ALL=C sort -z "$old" > "$old_sorted"
   LC_ALL=C sort -z "$new" > "$new_sorted"
   comm -z -23 "$old_sorted" "$new_sorted" | delete_paths
-  rm -f "$old_sorted" "$new_sorted"
+  cleanup_sorted_manifests
+  trap - EXIT
 fi
 `
 	return "bash -lc " + shellQuote(script)
@@ -1718,43 +1896,210 @@ func remoteFinalizeSync(workdir string, opts remoteSyncFinalizeOptions) string {
 	if opts.AllowMassDeletions {
 		allowValue = "1"
 	}
+	manifestName := remoteSyncPendingManifestName(opts.Token)
+	deletedName := remoteSyncPendingDeletedName(opts.Token)
 	script := `set -e
 cd ` + shellQuote(workdir) + `
+` + remoteGitWorkspaceFunctions() + `
 ` + remoteSyncMetaDirScript() + `
 mkdir -p "$meta_dir"
-new="$meta_dir/sync-manifest.new"
-deleted="$meta_dir/sync-deleted.new"
-rm -f "$deleted"
-mv "$new" "$meta_dir/sync-manifest"
-if test -d .git && git status --short >/tmp/crabbox-git-status 2>/dev/null; then
-  deletions=$(awk '/^ D|^D / { n++ } END { print n+0 }' /tmp/crabbox-git-status)
+new="$meta_dir/` + manifestName + `"
+deleted="$meta_dir/` + deletedName + `"
+manifest="$meta_dir/sync-manifest"
+committed_token="$meta_dir/sync-finalize-token"
+complete_token="$meta_dir/sync-finalize-complete-token"
+expected_token=` + shellQuote(opts.Token) + `
+publish_fingerprint=` + shellQuote(opts.Fingerprint) + `
+case "$expected_token" in
+  ''|*[!0-9a-f]*) echo "remote sync finalize failed: invalid sync token" >&2; exit 67 ;;
+esac
+` + remoteSyncFinalizeLockScript() + `
+git_status="$meta_dir/sync-git-status.$expected_token.$$"
+rm -f "$git_status"
+if [ -f "$manifest" ] &&
+   [ -f "$committed_token" ] && [ "$(cat "$committed_token")" = "$expected_token" ] &&
+   [ -f "$complete_token" ] && [ "$(cat "$complete_token")" = "$expected_token" ]; then
+  exit 0
+fi
+rm -f "$complete_token"
+if [ -f "$new" ]; then
+  committed_tmp="$committed_token.tmp.$$"
+  printf %s "$expected_token" > "$committed_tmp"
+  mv "$committed_tmp" "$committed_token"
+  rm -f "$deleted"
+  mv "$new" "$manifest"
+elif [ ! -f "$manifest" ] || [ ! -f "$committed_token" ] || [ "$(cat "$committed_token")" != "$expected_token" ]; then
+  echo "remote sync finalize failed: no committed manifest for this sync" >&2
+  exit 67
+fi
+`
+	if opts.Coherence.enabled() {
+		script += remoteGitCoherenceFinalizeScript(opts.Coherence, allowValue)
+	} else {
+		script += `publish_fingerprint=
+if exact_git_root && git status --short >"$git_status" 2>/dev/null; then
+  deletions=$(awk '/^ D|^D / { n++ } END { print n+0 }' "$git_status")
   if [ ` + shellQuote(allowValue) + ` != '1' ] && [ "$deletions" -ge 200 ]; then
     echo "remote sync sanity failed: $deletions tracked deletions" >&2
-    awk '/^ D|^D / { print "  " substr($0,4) }' /tmp/crabbox-git-status | head -20 >&2
+    awk '/^ D|^D / { print "  " substr($0,4) }' "$git_status" | head -20 >&2
     exit 66
   fi
 fi
 `
+	}
 	if opts.HydrateGit && opts.BaseRef != "" {
 		refspec := "+refs/heads/" + opts.BaseRef + ":refs/remotes/origin/" + opts.BaseRef
-		script += `if git rev-parse --is-inside-work-tree >/dev/null 2>&1 && git remote get-url origin >/dev/null 2>&1; then
-  git fetch --quiet --unshallow origin ` + shellQuote(refspec) + ` || git fetch --quiet --depth=1000 origin ` + shellQuote(refspec) + ` || git fetch --quiet origin ` + shellQuote(refspec) + ` || git fetch --quiet origin ` + shellQuote(opts.BaseRef) + ` || true
+		script += `if exact_git_root && git remote get-url origin >/dev/null 2>&1; then
+  if [ "$(git rev-parse --is-shallow-repository 2>/dev/null)" = true ]; then
+    git fetch --quiet --unshallow origin ` + shellQuote(refspec) + ` || git fetch --quiet --depth=1000 origin ` + shellQuote(refspec) + ` || git fetch --quiet origin ` + shellQuote(refspec) + ` || git fetch --quiet origin ` + shellQuote(opts.BaseRef) + ` || true
+  else
+    git fetch --quiet origin ` + shellQuote(refspec) + ` || git fetch --quiet origin ` + shellQuote(opts.BaseRef) + ` || true
+  fi
 fi
 `
 	}
 	if opts.BaseRef != "" && opts.BaseSHA != "" {
-		script += `printf %s ` + shellQuote(opts.BaseRef+" "+opts.BaseSHA+"\n") + ` > "$meta_dir/git-hydrate-base" || true
+		script += `base_tmp="$meta_dir/git-hydrate-base.tmp.$$"
+printf %s ` + shellQuote(opts.BaseRef+" "+opts.BaseSHA+"\n") + ` > "$base_tmp"
+mv "$base_tmp" "$meta_dir/git-hydrate-base"
 `
 	}
-	if opts.Fingerprint != "" {
-		script += `printf %s ` + shellQuote(opts.Fingerprint) + ` > "$meta_dir/sync-fingerprint" || true
+	script += `if [ -n "$publish_fingerprint" ]; then
+  fingerprint_tmp="$meta_dir/sync-fingerprint.tmp.$$"
+  printf %s "$publish_fingerprint" > "$fingerprint_tmp"
+  mv "$fingerprint_tmp" "$meta_dir/sync-fingerprint"
+else
+  rm -f "$meta_dir/sync-fingerprint"
+fi
+complete_tmp="$complete_token.tmp.$$"
+printf %s "$expected_token" > "$complete_tmp"
+mv "$complete_tmp" "$complete_token"
+coherence_committed=1
 `
-	}
 	return "bash -lc " + shellQuote(script)
 }
 
+func remoteGitCoherenceFinalizeScript(plan gitCoherencePlan, allowMassDeletions string) string {
+	return `
+coherence_committed=; coherence_mutated=; head_changed=; index_changed=
+tmp_ref="refs/crabbox/sync-$expected_token"; advertised_branch=` + shellQuote(plan.Branch) + `; expected_origin=` + shellQuote(plan.RemoteURL) + `
+if ! exact_git_root; then
+	publish_fingerprint=
+elif ! repair_origin; then
+	echo "remote sync finalize failed: Git origin repair failed" >&2; cleanup_finalize_lock; exit 67
+elif ! git fetch --quiet --no-tags "$expected_origin" "+refs/heads/$advertised_branch:$tmp_ref"; then
+	git update-ref -d "$tmp_ref" >/dev/null 2>&1 || true; echo "remote sync finalize failed: Git coherence fetch failed" >&2; cleanup_finalize_lock; exit 67
+elif ! git merge-base --is-ancestor ` + shellQuote(plan.Target) + ` "$tmp_ref" >/dev/null 2>&1; then
+	git update-ref -d "$tmp_ref" >/dev/null 2>&1 || true; echo "remote sync finalize failed: requested commit is not on advertised branch" >&2; cleanup_finalize_lock; exit 67
+elif [ "$(git rev-parse --verify ` + shellQuote(plan.Target+"^{tree}") + ` 2>/dev/null || true)" != ` + shellQuote(plan.Tree) + ` ]; then
+	git update-ref -d "$tmp_ref" >/dev/null 2>&1 || true; echo "remote sync finalize failed: requested Git tree verification failed" >&2; cleanup_finalize_lock; exit 67
+else
+  coherence_cleanup() {
+    status=$?
+    if [ -z "$coherence_committed" ] && [ -n "$coherence_mutated" ]; then
+      if [ -n "$head_changed" ]; then
+        if git update-ref --no-deref HEAD "$old_head" ` + shellQuote(plan.Target) + `; then
+          if [ -n "$old_sym" ] && ! git symbolic-ref -q HEAD >/dev/null 2>&1 &&
+             [ "$(git rev-parse --verify HEAD^{commit} 2>/dev/null || true)" = "$old_head" ] &&
+             [ "$(git rev-parse --verify "$old_sym^{commit}" 2>/dev/null || true)" = "$old_head" ]; then git symbolic-ref HEAD "$old_sym" || status=67; fi
+        else status=67; fi
+      fi
+      if [ -n "$index_changed" ] && [ "$(cat "$index_lock" 2>/dev/null || true)" = "$index_marker" ] && cmp -s "$index_path" "$index_verify"; then
+        cp -p "$index_backup" "$index_restore" && mv "$index_restore" "$index_path" || status=67
+      elif [ -n "$index_changed" ]; then status=67; fi
+    fi
+    git update-ref -d "$tmp_ref" "$fetched_head" >/dev/null 2>&1 || true; rm -f "${index_backup:-}" "${index_candidate:-}" "${index_verify:-}" "${index_restore:-}"
+    if [ -n "${index_lock:-}" ] && [ "$(cat "$index_lock" 2>/dev/null || true)" = "${index_marker:-}" ]; then rm -f "$index_lock"; fi
+    # Bash 5.2 can corrupt function context when a successful EXIT handler re-exits.
+    cleanup_finalize_lock; trap - EXIT; if [ "$status" -ne 0 ]; then exit "$status"; fi
+  }
+  trap coherence_cleanup EXIT
+  fetched_head="$(git rev-parse --verify "$tmp_ref^{commit}")"; old_head="$(git rev-parse --verify HEAD^{commit})"
+  old_sym="$(git symbolic-ref -q HEAD 2>/dev/null || true)"
+  index_path="$(git rev-parse --git-path index)"
+  case "$index_path" in /*) ;; *) index_path="$PWD/$index_path" ;; esac
+  index_lock="$index_path.lock"; index_marker="$expected_token.$$"
+  index_backup="$index_path.crabbox.$$.backup"; index_candidate="$index_path.crabbox.$$.new"; index_verify="$index_path.crabbox.$$.verify"; index_restore="$index_path.crabbox.$$.restore"
+  cp -p "$index_path" "$index_backup"; git read-tree --reset --index-output="$index_candidate" ` + shellQuote(plan.Target) + `
+  [ "$(GIT_INDEX_FILE="$index_candidate" git write-tree)" = ` + shellQuote(plan.Tree) + ` ]
+  GIT_INDEX_FILE="$index_candidate" git diff-files --name-status >"$git_status" 2>/dev/null ||
+    { echo "remote sync sanity failed: candidate Git index inspection failed" >&2; exit 67; }
+  deletions=$(awk '$1 == "D" { n++ } END { print n+0 }' "$git_status"); [ ` + shellQuote(allowMassDeletions) + ` = '1' ] || [ "$deletions" -lt 200 ]
+  (set -C; printf %s "$index_marker" > "$index_lock") || { echo "remote sync finalize failed: Git index is busy" >&2; exit 67; }
+  cmp -s "$index_path" "$index_backup" || { echo "remote sync finalize failed: Git index changed concurrently" >&2; exit 67; }
+  cp -p "$index_candidate" "$index_verify"; mv "$index_candidate" "$index_path"; index_changed=1; coherence_mutated=1
+  cmp -s "$index_path" "$index_verify" && [ "$(GIT_INDEX_FILE="$index_verify" git write-tree)" = ` + shellQuote(plan.Tree) + ` ] || { echo "remote sync finalize failed: installed Git index verification failed" >&2; exit 67; }
+  git update-ref --no-deref HEAD ` + shellQuote(plan.Target) + ` "$old_head"; head_changed=1
+  [ "$(git rev-parse --verify HEAD^{commit})" = ` + shellQuote(plan.Target) + ` ]
+fi
+`
+}
+
+func remoteSyncFinalizeLockScript() string {
+	return `lock_path="$meta_dir/sync-finalize-lock"
+lock_waits=0
+while ! ln -s "$$" "$lock_path" 2>/dev/null; do
+  lock_owner=$(readlink "$lock_path" 2>/dev/null || true)
+  lock_owner_live=
+  case "$lock_owner" in
+    ''|*[!0-9]*) ;;
+    *) if kill -0 "$lock_owner" 2>/dev/null; then lock_owner_live=1; fi ;;
+  esac
+  if [ -n "$lock_owner_live" ]; then
+    sleep 1
+  else
+    sleep 1
+    confirmed_owner=$(readlink "$lock_path" 2>/dev/null || true)
+    if [ "$confirmed_owner" = "$lock_owner" ]; then
+      owner_dead=
+      case "$confirmed_owner" in
+        ''|*[!0-9]*) owner_dead=1 ;;
+        *) if ! kill -0 "$confirmed_owner" 2>/dev/null; then owner_dead=1; fi ;;
+      esac
+      if [ -n "$owner_dead" ]; then
+        stale_lock="$lock_path.stale.$$"
+        if mv "$lock_path" "$stale_lock" 2>/dev/null; then
+          moved_owner=$(readlink "$stale_lock" 2>/dev/null || true)
+          if [ "$moved_owner" != "$confirmed_owner" ]; then
+            if [ ! -e "$lock_path" ] && [ ! -L "$lock_path" ]; then
+              mv "$stale_lock" "$lock_path" 2>/dev/null || true
+            fi
+            echo "remote sync finalize failed: lock ownership changed during recovery" >&2
+            exit 67
+          fi
+          rm -f "$stale_lock"
+          continue
+        fi
+      fi
+    fi
+  fi
+  lock_waits=$((lock_waits + 1))
+  if [ "$lock_waits" -ge 120 ]; then
+    echo "remote sync finalize failed: timed out waiting for active finalize" >&2
+    exit 67
+  fi
+done
+cleanup_finalize_lock() {
+  if [ -n "${git_status:-}" ]; then
+    rm -f -- "$git_status"
+  fi
+  if [ "$(readlink "$lock_path" 2>/dev/null || true)" = "$$" ]; then
+    rm -f "$lock_path"
+  fi
+}
+trap cleanup_finalize_lock EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+`
+}
+
 func remoteSyncMetaDirScript() string {
-	return "meta_dir=$(if [ -d .git ]; then printf %s .git/crabbox; else printf %s .crabbox; fi); "
+	return `meta_dir=$(git_root=; if git_root="$(git rev-parse --show-toplevel 2>/dev/null)" &&
+  git_root="$(cd -P -- "$git_root" 2>/dev/null && pwd -P)" &&
+  [ "$git_root" = "$(pwd -P)" ]; then git rev-parse --git-path crabbox; else printf %s .crabbox; fi)
+case "$meta_dir" in /*) ;; *) meta_dir="$PWD/$meta_dir" ;; esac
+`
 }
 
 func remoteSyncSanity(workdir string, allowMassDeletions bool) string {
@@ -1763,11 +2108,11 @@ func remoteSyncSanity(workdir string, allowMassDeletions bool) string {
 		allowValue = "1"
 	}
 	return "cd " + shellQuote(workdir) + " && " +
-		"if test -d .git && git status --short >/tmp/crabbox-git-status 2>/dev/null; then " +
-		"deletions=$(awk '/^ D|^D / { n++ } END { print n+0 }' /tmp/crabbox-git-status); " +
+		"if test -d .git && git_status_output=$(git status --short 2>/dev/null); then " +
+		"deletions=$(printf '%s\\n' \"$git_status_output\" | awk '/^ D|^D / { n++ } END { print n+0 }'); " +
 		"if [ " + shellQuote(allowValue) + " != '1' ] && [ \"$deletions\" -ge 200 ]; then " +
 		"echo \"remote sync sanity failed: $deletions tracked deletions\" >&2; " +
-		"awk '/^ D|^D / { print \"  \" substr($0,4) }' /tmp/crabbox-git-status | head -20 >&2; " +
+		"printf '%s\\n' \"$git_status_output\" | awk '/^ D|^D / { print \"  \" substr($0,4) }' | head -20 >&2; " +
 		"exit 66; " +
 		"fi; " +
 		"fi"

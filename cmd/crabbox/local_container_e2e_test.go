@@ -40,7 +40,7 @@ func TestLocalContainerProviderE2E(t *testing.T) {
 
 	image := strings.TrimSpace(os.Getenv("CRABBOX_LOCAL_CONTAINER_E2E_IMAGE"))
 	if image == "" {
-		image = "debian:bookworm"
+		image = "golang:1.26-bookworm"
 	}
 	tag := strings.ToLower(strings.ReplaceAll(t.Name(), "_", "-"))
 	if len(tag) > 16 {
@@ -68,10 +68,13 @@ func TestLocalContainerProviderE2E(t *testing.T) {
 		"--timing-json",
 		"--shell",
 		"--",
-		"set -eu; test -f go.mod; test -f internal/providers/localcontainer/backend.go; echo CRABBOX_LOCAL_CONTAINER_SYNC_OK",
+		"set -eu; test -f go.mod; test -f internal/providers/localcontainer/backend.go; printf 'CRABBOX_LOCAL_CONTAINER_IMAGE_PATH=%s\\n' \"$PATH\"; echo CRABBOX_LOCAL_CONTAINER_SYNC_OK",
 	)
 	if !strings.Contains(oneShot.Stdout, "CRABBOX_LOCAL_CONTAINER_SYNC_OK") {
 		t.Fatalf("one-shot output missing sync marker: stdout=%q stderr=%q", oneShot.Stdout, oneShot.Stderr)
+	}
+	if imagePath := localContainerE2EImagePath(t, ctx, image); imagePath != "" && !strings.Contains(oneShot.Stdout, "CRABBOX_LOCAL_CONTAINER_IMAGE_PATH="+imagePath+"\n") {
+		t.Fatalf("one-shot PATH did not preserve image PATH %q: stdout=%q stderr=%q", imagePath, oneShot.Stdout, oneShot.Stderr)
 	}
 	assertNoLocalContainerForSlug(t, ctx, oneShotSlug)
 
@@ -94,20 +97,35 @@ func TestLocalContainerProviderE2E(t *testing.T) {
 	})
 
 	runCrabboxLocalContainerE2EMust(t, ctx, "status", "--provider", "docker", "--id", leaseID, "--wait", "--json")
-	reuse := runCrabboxLocalContainerE2EMust(t, ctx,
+	firstLogin := runCrabboxLocalContainerE2EMust(t, ctx,
 		"run",
 		"--provider", "docker",
 		"--id", leaseID,
 		"--no-sync",
 		"--timing-json",
+		"--shell",
 		"--",
-		"echo", "CRABBOX_LOCAL_CONTAINER_REUSE_OK",
+		`set -eu; test "$(command -v go)" = /usr/local/go/bin/go; test "$(stat -c '%U:%G:%a' /etc/profile.d/crabbox-image-path.sh)" = root:root:644; mkdir -p "$HOME/profile-bin"; printf '%s\n' 'export PATH="$HOME/profile-bin:$PATH"' > "$HOME/.bash_profile"; echo CRABBOX_LOCAL_CONTAINER_FIRST_LOGIN_OK`,
 	)
-	if !strings.Contains(reuse.Stdout, "CRABBOX_LOCAL_CONTAINER_REUSE_OK") {
-		t.Fatalf("reuse output missing marker: stdout=%q stderr=%q", reuse.Stdout, reuse.Stderr)
+	if !strings.Contains(firstLogin.Stdout, "CRABBOX_LOCAL_CONTAINER_FIRST_LOGIN_OK") {
+		t.Fatalf("first login output missing marker: stdout=%q stderr=%q", firstLogin.Stdout, firstLogin.Stderr)
+	}
+	secondLogin := runCrabboxLocalContainerE2EMust(t, ctx,
+		"run",
+		"--provider", "docker",
+		"--id", leaseID,
+		"--no-sync",
+		"--timing-json",
+		"--shell",
+		"--",
+		`set -eu; test "$(command -v go)" = /usr/local/go/bin/go; test "${PATH%%:*}" = "$HOME/profile-bin"; printf 'CRABBOX_LOCAL_CONTAINER_PROFILE_PATH=%s\n' "$PATH"; echo CRABBOX_LOCAL_CONTAINER_SECOND_LOGIN_OK`,
+	)
+	if !strings.Contains(secondLogin.Stdout, "CRABBOX_LOCAL_CONTAINER_SECOND_LOGIN_OK") ||
+		!strings.Contains(secondLogin.Stdout, "CRABBOX_LOCAL_CONTAINER_PROFILE_PATH=/home/crabbox/profile-bin:") {
+		t.Fatalf("second login did not retain profile precedence and image PATH: stdout=%q stderr=%q", secondLogin.Stdout, secondLogin.Stderr)
 	}
 	runCrabboxLocalContainerE2EMust(t, ctx, "stop", "--provider", "docker", leaseID)
-	assertNoLocalContainerForSlug(t, ctx, warmSlug)
+	assertNoLocalContainerLeaseState(t, ctx, leaseID, warmSlug)
 
 	staleWarmup := runCrabboxLocalContainerE2EMust(t, ctx,
 		"warmup",
@@ -168,6 +186,25 @@ func assertNoLocalContainerForSlug(t *testing.T, ctx context.Context, slug strin
 	}
 }
 
+func assertNoLocalContainerLeaseState(t *testing.T, ctx context.Context, leaseID, slug string) {
+	t.Helper()
+	assertNoLocalContainerForSlug(t, ctx, slug)
+	claim, err := cli.ReadLeaseClaim(leaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claim.LeaseID != "" {
+		t.Fatalf("local-container e2e left lease claim after cleanup: %#v", claim)
+	}
+	keyPath, err := cli.TestboxKeyPath(leaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(keyPath); !os.IsNotExist(err) {
+		t.Fatalf("local-container e2e left SSH key after cleanup: %v", err)
+	}
+}
+
 func localContainerIDForSlug(t *testing.T, ctx context.Context, slug string) string {
 	t.Helper()
 	commandCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
@@ -197,6 +234,23 @@ func runDockerLocalContainerE2EMust(t *testing.T, ctx context.Context, args ...s
 	if out, err := exec.CommandContext(commandCtx, "docker", args...).CombinedOutput(); err != nil {
 		t.Fatalf("docker %s failed: %v: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
 	}
+}
+
+func localContainerE2EImagePath(t *testing.T, ctx context.Context, image string) string {
+	t.Helper()
+	commandCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(commandCtx, "docker", "image", "inspect", "--format", "{{range .Config.Env}}{{println .}}{{end}}", image).CombinedOutput()
+	if err != nil {
+		t.Fatalf("docker image inspect %s failed: %v: %s", image, err, strings.TrimSpace(string(out)))
+	}
+	var imagePath string
+	for _, line := range strings.Split(string(out), "\n") {
+		if strings.HasPrefix(line, "PATH=") {
+			imagePath = strings.TrimPrefix(line, "PATH=")
+		}
+	}
+	return imagePath
 }
 
 func parseLocalContainerE2ELeaseID(stdout string) string {

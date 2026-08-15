@@ -50,7 +50,7 @@ func registerLeaseCreateFlags(fs *flag.FlagSet, defaults Config) leaseCreateFlag
 	fs.Var(&imageSDK, "image-sdk", "minimum SDK in name=version form; repeatable")
 	fs.Var(&imageRuntime, "image-runtime", "minimum runtime in name=version form; repeatable")
 	return leaseCreateFlagValues{
-		Provider:      fs.String("provider", defaults.Provider, providerHelpAll()),
+		Provider:      registerProviderSelectionFlag(fs, defaults, providerHelpAll()),
 		Profile:       fs.String("profile", defaults.Profile, "profile"),
 		Class:         fs.String("class", defaults.Class, "machine class"),
 		Architecture:  fs.String("arch", defaults.Architecture, "CPU architecture: amd64 or arm64"),
@@ -86,6 +86,37 @@ func applyLeaseCreateFlags(cfg *Config, fs *flag.FlagSet, values leaseCreateFlag
 
 func applyLeaseCreateFlagsForLease(cfg *Config, fs *flag.FlagSet, values leaseCreateFlagValues, existingLeaseID string) error {
 	return applyLeaseCreateFlagsForLeaseMode(cfg, fs, values, existingLeaseID, true)
+}
+
+func autoRouteClaimLeaseProvider(cfg *Config, fs *flag.FlagSet, identifier string) error {
+	if flagWasSet(fs, "provider") {
+		return nil
+	}
+	return autoRouteClaimLeaseProviderForIdentifier(cfg, identifier)
+}
+
+func autoRouteClaimLeaseProviderForIdentifier(cfg *Config, identifier string) error {
+	if providerSelectionIsAuthoritativeRoute(*cfg) {
+		return nil
+	}
+	provider, ok, err := claimProviderForIdentifier(identifier)
+	if err != nil {
+		return err
+	}
+	if ok {
+		setProviderSelection(cfg, provider, providerSelectionLeaseContext)
+	}
+	return nil
+}
+
+func autoRouteLeaseProviderForIdentifier(cfg *Config, fs *flag.FlagSet, identifier string) error {
+	if err := autoRouteClaimLeaseProvider(cfg, fs, identifier); err != nil {
+		return err
+	}
+	if err := autoRouteStaticLease(cfg, fs, identifier); err != nil {
+		return err
+	}
+	return autoRouteExternalLease(cfg, fs, identifier)
 }
 
 func applyLeaseCreateFlagsForLeaseMode(cfg *Config, fs *flag.FlagSet, values leaseCreateFlagValues, existingLeaseID string, mutateExternal bool) error {
@@ -148,10 +179,7 @@ func applyLeaseCreateFlagsForLeaseMode(cfg *Config, fs *flag.FlagSet, values lea
 	if err := applyTargetFlagOverrides(cfg, fs, values.Target); err != nil {
 		return err
 	}
-	if err := autoRouteStaticLease(cfg, fs, existingLeaseID); err != nil {
-		return err
-	}
-	if err := autoRouteExternalLease(cfg, fs, existingLeaseID); err != nil {
+	if err := autoRouteLeaseProviderForIdentifier(cfg, fs, existingLeaseID); err != nil {
 		return err
 	}
 	if flagWasSet(fs, "os") {
@@ -390,6 +418,11 @@ type leaseTargetConfigOptions struct {
 	// ssh provider so callers don't have to re-pass --provider / --static-host
 	// that warmup already implied.
 	LeaseID string
+	// ProviderResourceID marks LeaseID as a provider-native resource identifier,
+	// not a Crabbox lease identifier. Native snapshot operations use this to
+	// avoid routing unrelated claim, Static, or External lease identities that
+	// happen to match.
+	ProviderResourceID bool
 }
 
 func loadLeaseTargetConfig(fs *flag.FlagSet, provider string, targetFlags targetFlagValues, networkFlags networkModeFlagValues, opts leaseTargetConfigOptions) (Config, error) {
@@ -397,7 +430,11 @@ func loadLeaseTargetConfig(fs *flag.FlagSet, provider string, targetFlags target
 	if err != nil {
 		return Config{}, err
 	}
-	cfg.Provider = provider
+	if flagWasSet(fs, "provider") {
+		setProviderSelection(&cfg, provider, providerSelectionFlag)
+	} else {
+		cfg.Provider = provider
+	}
 	prepareProviderDefaults(&cfg)
 	if opts.Desktop {
 		cfg.Desktop = true
@@ -405,11 +442,10 @@ func loadLeaseTargetConfig(fs *flag.FlagSet, provider string, targetFlags target
 	if err := applyTargetFlagOverrides(&cfg, fs, targetFlags); err != nil {
 		return Config{}, err
 	}
-	if err := autoRouteStaticLease(&cfg, fs, opts.LeaseID); err != nil {
-		return Config{}, err
-	}
-	if err := autoRouteExternalLease(&cfg, fs, opts.LeaseID); err != nil {
-		return Config{}, err
+	if !opts.ProviderResourceID {
+		if err := autoRouteLeaseProviderForIdentifier(&cfg, fs, opts.LeaseID); err != nil {
+			return Config{}, err
+		}
 	}
 	if err := applyNetworkModeFlagOverride(&cfg, fs, networkFlags); err != nil {
 		return Config{}, err

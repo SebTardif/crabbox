@@ -41,13 +41,22 @@ verifier, publisher, or Homebrew updater.
 The publishing checkout must have `HEAD` exactly equal to the protected verifier
 commit, and every release-policy or executable tooling file must match that
 commit with no staged, unstaged, or untracked replacement. Fetch every detailed
-repository ruleset. One active no-bypass branch ruleset must cover the default
-branch and require deletion/non-fast-forward protection, code-owner pull
-requests with stale-review dismissal, last-push approval and at least one
-approval, plus strict required status checks. A separate active no-bypass tag
-ruleset must cover every `refs/tags/v*` release tag and prevent deletion and
-updates. Before publication, an administrator must also freeze all
-default-branch, tag, and Releases API writers for the non-atomic final gate.
+repository ruleset. One active approval ruleset must cover the default branch,
+require code-owner pull requests with stale-review dismissal, last-push
+approval and at least one approval, and grant exactly one bypass to the
+`openclaw-secops` release team (GitHub team ID `16654667`) in `pull_request`
+mode. That allows a release admin to merge their own PR without granting a
+direct-push path. A separate active no-bypass branch ruleset must enforce
+deletion and non-fast-forward protection. The default branch must also be
+covered by the no-bypass OpenClaw organization workflow
+`.github/workflows/crabbox-release-check.yml` from
+`openclaw/release-workflows` repository ID `1304559357` at
+`refs/heads/main`. That protected external workflow owns the credential-free
+macOS release snapshot check, so a Crabbox pull request cannot redefine the
+check that gates its own merge. A separate active no-bypass tag ruleset must
+cover every `refs/tags/v*` release tag and prevent deletion and updates. Before
+publication, an administrator must also freeze all default-branch, tag, and
+Releases API writers for the non-atomic final gate.
 
 GitHub omits ruleset bypass actors from the ordinary workflow token. Configure
 `CRABBOX_RULESET_READ_TOKEN` as a fine-grained repository secret scoped only to
@@ -189,6 +198,7 @@ TAG=vX.Y.Z
 TAG_OBJECT=$(git rev-parse "refs/tags/$TAG")
 TAG_COMMIT=$(git rev-parse "refs/tags/$TAG^{commit}")
 VERIFIER_COMMIT=$(git rev-parse HEAD)
+WORKFLOW_COMMIT=$VERIFIER_COMMIT
 
 DEFAULT_BRANCH=main \
 RELEASE_TAG="$TAG" \
@@ -286,6 +296,7 @@ gh workflow run release-assets.yml \
   -f tag_object="$TAG_OBJECT" \
   -f tag_commit="$TAG_COMMIT" \
   -f verifier_commit="$VERIFIER_COMMIT" \
+  -f workflow_commit="$WORKFLOW_COMMIT" \
   -f draft=true
 
 : "${DRAFT_VERIFIER_RUN_ID:?set to the numeric ID of that exact draft run}"
@@ -294,19 +305,28 @@ gh run watch "$DRAFT_VERIFIER_RUN_ID" \
 ```
 
 Stop for the publication gate. Publication takes the exact successful draft
-run ID and repeats the tag as its explicit confirmation:
+run ID, its protected workflow commit, and repeats the tag as its explicit
+confirmation. The seven-argument compatibility form is only for historical
+runs where `WORKFLOW_COMMIT` exactly equals `VERIFIER_COMMIT`:
 
 ```sh
 CRABBOX_RELEASE_SERIALIZATION_CONFIRMED="$TAG:$RELEASE_ID" \
 scripts/publish-release.sh \
   "$RELEASE_ID" "$TAG" "$TAG_OBJECT" "$TAG_COMMIT" \
-  "$VERIFIER_COMMIT" "$DRAFT_VERIFIER_RUN_ID" "$TAG"
+  "$VERIFIER_COMMIT" "$WORKFLOW_COMMIT" "$DRAFT_VERIFIER_RUN_ID" "$TAG"
 ```
 
 Stop again. Dispatch a new native run against the published state; do not reuse
-the draft proof. Capture and wait for the exact new run:
+the draft proof. `VERIFIER_COMMIT` remains the immutable candidate-provenance
+commit. Bind the new run separately to the current protected workflow commit,
+which must descend from that verifier, then capture and wait for the exact run:
 
 ```sh
+WORKFLOW_COMMIT=$(git rev-parse HEAD)
+test "$(git ls-remote origin refs/heads/main | awk '{print $1}')" = "$WORKFLOW_COMMIT"
+git merge-base --is-ancestor "$VERIFIER_COMMIT" "$WORKFLOW_COMMIT"
+git merge-base --is-ancestor "$TAG_COMMIT" "$VERIFIER_COMMIT"
+
 gh workflow run release-assets.yml \
   --repo openclaw/crabbox \
   --ref main \
@@ -315,6 +335,7 @@ gh workflow run release-assets.yml \
   -f tag_object="$TAG_OBJECT" \
   -f tag_commit="$TAG_COMMIT" \
   -f verifier_commit="$VERIFIER_COMMIT" \
+  -f workflow_commit="$WORKFLOW_COMMIT" \
   -f draft=false
 
 : "${PUBLIC_VERIFIER_RUN_ID:?set to the numeric ID of that exact public run}"
@@ -388,7 +409,19 @@ emitted only after success, so retries cannot append to partial JSON. The wrappe
 never adds an authorization header or skips a pre/postflight read.
 
 ```sh
-
+HOMEBREW_TOOLING_COMMIT=$(git rev-parse HEAD)
+case "$(git remote get-url origin)" in
+  https://github.com/openclaw/crabbox | https://github.com/openclaw/crabbox.git) ;;
+  *) false ;;
+esac
+REMOTE_MAIN=$(git ls-remote https://github.com/openclaw/crabbox \
+  refs/heads/main | awk '{print $1}')
+git -c fetch.writeCommitGraph=false fetch --quiet --no-tags \
+  https://github.com/openclaw/crabbox "$REMOTE_MAIN"
+git merge-base --is-ancestor "$HOMEBREW_TOOLING_COMMIT" "$REMOTE_MAIN"
+git merge-base --is-ancestor "$VERIFIER_COMMIT" "$HOMEBREW_TOOLING_COMMIT"
+git merge-base --is-ancestor "$TAG_COMMIT" "$VERIFIER_COMMIT"
+CRABBOX_VERIFY_TOOLING_COMMIT="$HOMEBREW_TOOLING_COMMIT" \
 scripts/verify-homebrew-release.sh \
   "$TAG" "$PUBLIC_ASSETS" \
   "$TAG_OBJECT" "$TAG_COMMIT" "$VERIFIER_COMMIT" \
@@ -407,8 +440,8 @@ comparison to close the verification window. It does not update the tap. The
 tap formula must be byte-for-byte output from the protected
 `scripts/render-homebrew-formula.mjs`; any additional Ruby, interpolation, or
 format drift is rejected before Homebrew evaluates it. Protected downstream
-tooling must remain clean at the verifier commit before and after candidate
-execution. The
+tooling must remain clean at the explicit tooling commit, and the immutable
+candidate verifier must be its ancestor, before and after candidate execution. The
 lower-level `codesign-macos.sh`, `extract-release-notes.sh`,
 `release-provenance.mjs`, `validate-release-publication.mjs`,
 `verify-go-release-binary.mjs`, and `verify-macos-binary.sh` are internal to the
@@ -521,10 +554,12 @@ notarization checks. Apple Silicon also runs the helper's non-mutating info path
 This bounded verifier is the installed-binary smoke; it does not create a lease.
 Only both native proofs complete the Homebrew gate.
 
-The Homebrew workflow itself runs from the current protected `main` commit,
-while its verification checkout remains pinned to the release record's
-protected verifier commit. This keeps published provenance immutable while
-allowing a protected workflow-only repair to restore the downstream proof.
+The Homebrew workflow and verification checkout run from the current protected
+`main` commit. The public release run and proof bind their own workflow commit,
+while candidate provenance remains pinned to the older verifier commit; each
+tooling commit must descend from that immutable verifier. This keeps published
+provenance immutable while allowing a protected workflow-only repair to restore
+the downstream proof.
 
 ## Cancellation And Recovery
 

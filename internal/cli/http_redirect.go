@@ -5,14 +5,13 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
-	"time"
 )
 
 // redirectCheckedHTTPClient clones source so callers can constrain redirects
 // without mutating a shared client or discarding its transport and timeouts.
 func redirectCheckedHTTPClient(source *http.Client, check func(*http.Request) error) *http.Client {
 	if source == nil {
-		source = &http.Client{Timeout: 60 * time.Second}
+		source = http.DefaultClient
 	}
 	client := *source
 	originalCheckRedirect := source.CheckRedirect

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net/url"
@@ -11,7 +12,9 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -21,6 +24,134 @@ type Repo struct {
 	RemoteURL string
 	Head      string
 	BaseRef   string
+}
+
+type repositoryBoundaryKind uint8
+
+const (
+	repositoryBoundaryGit repositoryBoundaryKind = iota + 1
+	repositoryBoundaryNativeJujutsu
+)
+
+type repositoryBoundary struct {
+	root string
+	kind repositoryBoundaryKind
+}
+
+// nearestRepositoryBoundary keeps repository ownership tied to the closest
+// workspace marker before stop. In particular, Git must not discover an outer
+// checkout through a native Jujutsu workspace nested inside it.
+func nearestRepositoryBoundary(start, stop string) (repositoryBoundary, error) {
+	current, err := filepath.Abs(start)
+	if err != nil {
+		return repositoryBoundary{}, err
+	}
+	current = canonicalRepositoryPath(current)
+	start = current
+	if stop != "" {
+		stop = canonicalRepositoryPath(stop)
+	}
+	ceilings := gitDiscoveryCeilings()
+	for {
+		if stop != "" && sameCanonicalRepositoryPath(current, stop) {
+			return repositoryBoundary{}, nil
+		}
+		if len(ceilings) > 0 && !sameCanonicalRepositoryPath(current, start) && canonicalRepositoryPathSetContains(ceilings, current) {
+			return repositoryBoundary{}, nil
+		}
+		hasGit, err := repositoryMarkerExists(filepath.Join(current, ".git"))
+		if err != nil {
+			return repositoryBoundary{}, err
+		}
+		hasJujutsu, err := repositoryMarkerExists(filepath.Join(current, ".jj"))
+		if err != nil {
+			return repositoryBoundary{}, err
+		}
+		if hasGit {
+			if hasJujutsu && !gitBoundaryIsValid(current) {
+				return repositoryBoundary{root: current, kind: repositoryBoundaryNativeJujutsu}, nil
+			}
+			return repositoryBoundary{root: current, kind: repositoryBoundaryGit}, nil
+		}
+		if hasJujutsu {
+			return repositoryBoundary{root: current, kind: repositoryBoundaryNativeJujutsu}, nil
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return repositoryBoundary{}, nil
+		}
+		current = parent
+	}
+}
+
+func gitBoundaryIsValid(root string) bool {
+	cmd := exec.Command("git", "rev-parse", "--show-toplevel")
+	cmd.Dir = root
+	cmd.Env = repositoryGitEnvironmentWithCeiling(filepath.Dir(root))
+	out, err := cmd.Output()
+	return err == nil && sameRepositoryPath(strings.TrimSpace(string(out)), root)
+}
+
+func repositoryGitEnvironmentWithCeiling(ceiling string) []string {
+	env := childEnvironmentWithout(repositoryGitEnvironment(), "GIT_CEILING_DIRECTORIES")
+	return append(env, "GIT_CEILING_DIRECTORIES="+ceiling)
+}
+
+func explicitGitRepositoryRouting() bool {
+	return strings.TrimSpace(os.Getenv("GIT_DIR")) != "" || strings.TrimSpace(os.Getenv("GIT_WORK_TREE")) != ""
+}
+
+func gitDiscoveryCeilings() []string {
+	entries := filepath.SplitList(os.Getenv("GIT_CEILING_DIRECTORIES"))
+	ceilings := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry == "" || !filepath.IsAbs(entry) {
+			continue
+		}
+		ceilings = append(ceilings, canonicalRepositoryPath(entry))
+	}
+	return ceilings
+}
+
+func canonicalRepositoryPathSetContains(paths []string, candidate string) bool {
+	for _, path := range paths {
+		if sameCanonicalRepositoryPath(path, candidate) {
+			return true
+		}
+	}
+	return false
+}
+
+func sameRepositoryPath(left, right string) bool {
+	left = canonicalRepositoryPath(left)
+	right = canonicalRepositoryPath(right)
+	return sameCanonicalRepositoryPath(left, right)
+}
+
+func sameCanonicalRepositoryPath(left, right string) bool {
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(left, right)
+	}
+	return left == right
+}
+
+func canonicalRepositoryPath(value string) string {
+	value = filepath.Clean(value)
+	if resolved, err := filepath.EvalSymlinks(value); err == nil {
+		return filepath.Clean(resolved)
+	}
+	return value
+}
+
+func repositoryMarkerExists(marker string) (bool, error) {
+	_, err := os.Lstat(marker)
+	if err == nil {
+		return true, nil
+	}
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	return false, fmt.Errorf("inspect repository marker %s: %w", marker, err)
 }
 
 // Repository inspection never needs provider or desktop credentials. Keep its
@@ -38,9 +169,14 @@ func repositoryGitEnvironment() []string {
 	}
 	result := make([]string, 0, len(allowed)+4)
 	for _, entry := range os.Environ() {
-		name, _, _ := strings.Cut(entry, "=")
+		name, value, _ := strings.Cut(entry, "=")
 		upper := strings.ToUpper(name)
 		if _, ok := allowed[upper]; ok || strings.HasPrefix(upper, "LC_") {
+			if (upper == "GIT_DIR" || upper == "GIT_WORK_TREE") && value != "" && !filepath.IsAbs(value) {
+				if absolute, err := filepath.Abs(value); err == nil {
+					entry = name + "=" + absolute
+				}
+			}
 			result = append(result, entry)
 		}
 	}
@@ -49,6 +185,8 @@ func repositoryGitEnvironment() []string {
 
 type gitTrackedPath struct {
 	name         string
+	mode         string
+	stage        int
 	skipWorktree bool
 }
 
@@ -60,70 +198,134 @@ func GitCheckoutHasHiddenOmissions(root string) (bool, error) {
 }
 
 func gitCheckoutHasHiddenOmissions(root string, resolveSparseRules func(string, []gitTrackedPath) (map[string]struct{}, error)) (bool, error) {
+	path, err := gitCheckoutHiddenOmission(root, nil, resolveSparseRules)
+	return path != "", err
+}
+
+func gitCheckoutHiddenOmission(
+	root string,
+	inScope func(gitTrackedPath) bool,
+	resolveSparseRules func(string, []gitTrackedPath) (map[string]struct{}, error),
+) (string, error) {
 	if strings.TrimSpace(root) == "" {
-		return false, nil
+		return "", nil
 	}
-	sparseEnabled := strings.EqualFold(
+	sparseEnabled := gitCheckoutSparseEnabled(root)
+	if !sparseEnabled && gitOutput(root, "rev-parse", "--is-inside-work-tree") != "true" {
+		return "", nil
+	}
+	tracked, err := loadGitTrackedPaths(root)
+	if err != nil {
+		return "", err
+	}
+	return gitCheckoutHiddenOmissionForTracked(root, tracked, sparseEnabled, inScope, resolveSparseRules)
+}
+
+func gitCheckoutSparseEnabled(root string) bool {
+	return strings.EqualFold(
 		strings.TrimSpace(gitOutput(root, "config", "--bool", "core.sparseCheckout")),
 		"true",
 	)
-	if !sparseEnabled && gitOutput(root, "rev-parse", "--is-inside-work-tree") != "true" {
-		return false, nil
-	}
-	trackedCmd := exec.Command("git", "ls-files", "-t", "-z")
+}
+
+func loadGitTrackedPaths(root string) ([]gitTrackedPath, error) {
+	trackedCmd := exec.Command("git", "ls-files", "-t", "--stage", "-z")
 	trackedCmd.Dir = root
+	trackedCmd.Env = repositoryGitEnvironment()
 	tagged, err := trackedCmd.Output()
 	if err != nil {
-		return false, fmt.Errorf("list tracked paths: %w", err)
+		return nil, fmt.Errorf("list tracked paths: %w", err)
 	}
-	if len(tagged) == 0 {
-		return false, nil
+	tracked, err := parseGitTrackedPaths(tagged)
+	if err != nil {
+		return nil, err
 	}
-	tracked := make([]gitTrackedPath, 0, bytes.Count(tagged, []byte{0}))
-	for _, entry := range bytes.Split(tagged, []byte{0}) {
-		if len(entry) == 0 {
+	return tracked, nil
+}
+
+func gitCheckoutHiddenOmissionForTracked(
+	root string,
+	tracked []gitTrackedPath,
+	sparseEnabled bool,
+	inScope func(gitTrackedPath) bool,
+	resolveSparseRules func(string, []gitTrackedPath) (map[string]struct{}, error),
+) (string, error) {
+	scoped := make([]gitTrackedPath, 0, len(tracked))
+	for _, entry := range tracked {
+		if inScope != nil && !inScope(entry) {
 			continue
 		}
-		if len(entry) < 3 || entry[1] != ' ' {
-			return false, fmt.Errorf("parse tracked path metadata")
-		}
-		path := string(entry[2:])
-		tracked = append(tracked, gitTrackedPath{name: path, skipWorktree: entry[0] == 'S'})
+		scoped = append(scoped, entry)
+	}
+	if len(scoped) == 0 {
+		return "", nil
 	}
 	includedPaths := make(map[string]struct{})
 	var sparseRulesErr error
 	if sparseEnabled {
-		includedPaths, sparseRulesErr = resolveSparseRules(root, tracked)
+		includedPaths, sparseRulesErr = resolveSparseRules(root, scoped)
 	}
-	for _, path := range tracked {
-		if sparseEnabled && sparseRulesErr != nil && !path.skipWorktree {
-			exists, statErr := trackedPathExistsWithoutSymlinkAncestor(root, path.name)
+	for _, entry := range scoped {
+		if sparseEnabled && sparseRulesErr != nil && !entry.skipWorktree {
+			exists, statErr := trackedPathExistsWithoutSymlinkAncestor(root, entry.name)
 			if statErr != nil {
-				return false, fmt.Errorf("inspect tracked path %q: %w", path.name, statErr)
+				return "", fmt.Errorf("inspect tracked path %q: %w", entry.name, statErr)
 			}
 			if !exists {
-				return false, fmt.Errorf("classify missing tracked path %q without git sparse-checkout check-rules (requires Git 2.41 or newer): %w", path.name, sparseRulesErr)
+				return "", fmt.Errorf("classify missing tracked path %q without git sparse-checkout check-rules (requires Git 2.41 or newer): %w", entry.name, sparseRulesErr)
 			}
 			continue
 		}
-		hiddenCandidate := path.skipWorktree
+		hiddenCandidate := entry.skipWorktree
 		if sparseEnabled && sparseRulesErr == nil {
-			_, ruleIncludesPath := includedPaths[path.name]
+			_, ruleIncludesPath := includedPaths[entry.name]
 			hiddenCandidate = hiddenCandidate || !ruleIncludesPath
 		}
 		if !hiddenCandidate {
 			continue
 		}
-		exists, statErr := trackedPathExistsWithoutSymlinkAncestor(root, path.name)
+		exists, statErr := trackedPathExistsWithoutSymlinkAncestor(root, entry.name)
 		if statErr != nil {
-			return false, fmt.Errorf("inspect tracked path %q: %w", path.name, statErr)
+			return "", fmt.Errorf("inspect tracked path %q: %w", entry.name, statErr)
 		}
 		if exists {
 			continue
 		}
-		return true, nil
+		return entry.name, nil
 	}
-	return false, nil
+	return "", nil
+}
+
+func parseGitTrackedPaths(tagged []byte) ([]gitTrackedPath, error) {
+	tracked := make([]gitTrackedPath, 0, bytes.Count(tagged, []byte{0}))
+	for _, record := range bytes.Split(tagged, []byte{0}) {
+		if len(record) == 0 {
+			continue
+		}
+		if len(record) < 3 || record[1] != ' ' {
+			return nil, fmt.Errorf("parse tracked path metadata")
+		}
+		metadata, name, ok := bytes.Cut(record[2:], []byte{'\t'})
+		fields := bytes.Fields(metadata)
+		if !ok || len(name) == 0 || len(fields) != 3 {
+			return nil, fmt.Errorf("parse tracked path metadata")
+		}
+		mode := string(fields[0])
+		if _, err := strconv.ParseUint(mode, 8, 32); err != nil {
+			return nil, fmt.Errorf("parse tracked path mode %q", mode)
+		}
+		stage, err := strconv.Atoi(string(fields[2]))
+		if err != nil || stage < 0 || stage > 3 {
+			return nil, fmt.Errorf("parse tracked path stage %q", fields[2])
+		}
+		tracked = append(tracked, gitTrackedPath{
+			name:         string(name),
+			mode:         mode,
+			stage:        stage,
+			skipWorktree: record[0] == 'S',
+		})
+	}
+	return tracked, nil
 }
 
 func trackedPathExistsWithoutSymlinkAncestor(root, gitPath string) (bool, error) {
@@ -153,6 +355,7 @@ func sparseCheckoutIncludedPaths(root string, tracked []gitTrackedPath) (map[str
 	}
 	cmd := exec.Command("git", "sparse-checkout", "check-rules", "-z")
 	cmd.Dir = root
+	cmd.Env = repositoryGitEnvironment()
 	cmd.Stdin = bytes.NewReader(paths.Bytes())
 	out, err := cmd.Output()
 	if err != nil {
@@ -177,9 +380,29 @@ func findRepo() (Repo, error) {
 	out, err := cmd.Output()
 	if err != nil {
 		wd, _ := os.Getwd()
+		if !explicitGitRepositoryRouting() {
+			boundary, boundaryErr := nearestRepositoryBoundary(wd, "")
+			if boundaryErr != nil {
+				return Repo{}, boundaryErr
+			}
+			if boundary.kind == repositoryBoundaryNativeJujutsu {
+				return Repo{Root: boundary.root, Name: filepath.Base(boundary.root)}, nil
+			}
+		}
 		return Repo{Root: wd, Name: filepath.Base(wd)}, nil
 	}
 	root := strings.TrimSpace(string(out))
+	if !explicitGitRepositoryRouting() {
+		wd, getwdErr := os.Getwd()
+		if getwdErr != nil {
+			return Repo{}, getwdErr
+		}
+		if boundary, boundaryErr := nearestRepositoryBoundary(wd, root); boundaryErr != nil {
+			return Repo{}, boundaryErr
+		} else if boundary.kind == repositoryBoundaryNativeJujutsu {
+			return Repo{Root: boundary.root, Name: filepath.Base(boundary.root)}, nil
+		}
+	}
 	remoteURL := gitOutput(root, "remote", "get-url", "origin")
 	return Repo{
 		Root:      root,
@@ -262,18 +485,65 @@ func defaultExcludes() []string {
 	return append(excludes, protectedSyncExcludes()...)
 }
 
-func configuredExcludes(cfg Config) []string {
-	return appendOrderedStrings(defaultExcludes(), cfg.Sync.Excludes...)
+type syncExcludeOrigin uint8
+
+const (
+	syncExcludeBuiltIn syncExcludeOrigin = iota
+	syncExcludeConfigured
+	syncExcludeProtected
+)
+
+type syncExcludeRule struct {
+	pattern string
+	origin  syncExcludeOrigin
 }
 
-func syncExcludes(root string, cfg Config) ([]string, error) {
+// SyncExcludeRules keeps ordered matcher provenance internal while allowing
+// provider adapters to pass the rules back to the core manifest owner.
+type SyncExcludeRules struct {
+	rules []syncExcludeRule
+}
+
+func configuredExcludes(cfg Config) SyncExcludeRules {
+	rules := newSyncExcludeRules(defaultExcludes(), syncExcludeBuiltIn)
+	for i := range rules.rules {
+		if isProtectedSyncExclude(rules.rules[i].pattern) {
+			rules.rules[i].origin = syncExcludeProtected
+		}
+	}
+	return rules.append(cfg.Sync.Excludes, syncExcludeConfigured)
+}
+
+func syncExcludes(root string, cfg Config) (SyncExcludeRules, error) {
 	excludes := configuredExcludes(cfg)
 	ignore, err := readCrabboxIgnore(root)
 	if err != nil {
-		return nil, err
+		return SyncExcludeRules{}, err
 	}
-	excludes = appendOrderedStrings(excludes, ignore...)
-	return appendOrderedStrings(excludes, protectedSyncExcludes()...), nil
+	excludes = excludes.append(ignore, syncExcludeConfigured)
+	return excludes.append(protectedSyncExcludes(), syncExcludeProtected), nil
+}
+
+func newSyncExcludeRules(patterns []string, origin syncExcludeOrigin) SyncExcludeRules {
+	return (SyncExcludeRules{}).append(patterns, origin)
+}
+
+func (r SyncExcludeRules) append(patterns []string, origin syncExcludeOrigin) SyncExcludeRules {
+	out := SyncExcludeRules{rules: append([]syncExcludeRule(nil), r.rules...)}
+	for _, pattern := range patterns {
+		if pattern = strings.TrimSpace(pattern); pattern != "" {
+			out.rules = append(out.rules, syncExcludeRule{pattern: pattern, origin: origin})
+		}
+	}
+	return out
+}
+
+func (r SyncExcludeRules) patterns() []string {
+	out := make([]string, 0, len(r.rules))
+	for _, rule := range r.rules {
+		out = append(out, rule.pattern)
+	}
+	return out
 }
 
 func protectedSyncExcludes() []string {
@@ -283,6 +553,30 @@ func protectedSyncExcludes() []string {
 		".crabbox/logs",
 		".crabbox/captures",
 		".crabbox/runs",
+	}
+}
+
+func isProtectedSyncExclude(pattern string) bool {
+	pattern = strings.ToLower(strings.Trim(filepath.ToSlash(pattern), "/"))
+	for _, protected := range protectedSyncExcludes() {
+		if pattern == protected {
+			return true
+		}
+	}
+	return false
+}
+
+func isAmbiguousBuiltInExclude(pattern string) bool {
+	pattern, negated := excludeRule(pattern)
+	if negated {
+		return false
+	}
+	pattern = strings.Trim(filepath.ToSlash(pattern), "/")
+	switch pattern {
+	case "dist", "dist-runtime", "coverage", "playwright-report", "test-results", ".build", "apps/*/.build", "target":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -310,26 +604,128 @@ func syncIncludes(cfg Config) []string {
 	return out
 }
 
-func syncGitSeedEnabled(cfg Config, repo Repo) bool {
-	enabled, _ := syncGitSeedDecision(cfg, repo)
-	return enabled
+type gitCoherencePlan struct{ RemoteURL, Target, Tree, Branch string }
+
+func (p gitCoherencePlan) seedEnabled() bool {
+	return p.RemoteURL != "" && normalizeGitRemoteURL(p.RemoteURL) == p.RemoteURL && p.Target != "" && p.Branch != ""
 }
 
-func syncGitSeedDecision(cfg Config, repo Repo) (enabled, credentialBlocked bool) {
-	if !cfg.Sync.GitSeed || len(syncIncludes(cfg)) != 0 || !remoteGitSeedSourceCandidate(repo) {
-		return false, false
+func (p gitCoherencePlan) enabled() bool { return p.seedEnabled() && p.Tree != "" }
+
+func syncGitCoherencePlan(cfg Config, repo Repo) (gitCoherencePlan, bool) {
+	if !cfg.Sync.GitSeed || len(syncIncludes(cfg)) != 0 || repo.Root == "" || repo.RemoteURL == "" || repo.Head == "" {
+		return gitCoherencePlan{}, false
 	}
 	if gitRemoteURLHasCredentials(repo.RemoteURL) {
-		return false, true
+		return gitCoherencePlan{}, true
 	}
-	return true, false
+	target := gitOutput(repo.Root, "rev-parse", "--verify", repo.Head+"^{commit}")
+	tree := gitOutput(repo.Root, "rev-parse", "--verify", repo.Head+"^{tree}")
+	branch := originBranchForTarget(repo.Root, repo.BaseRef, target)
+	plan := gitCoherencePlan{RemoteURL: normalizeGitRemoteURL(repo.RemoteURL), Target: target, Branch: branch}
+	if target == "" || target != repo.Head || branch == "" {
+		return gitCoherencePlan{}, false
+	}
+	overlayOnly, err := gitTargetRequiresOverlayOnly(repo.Root, target)
+	if tree == "" || err != nil || overlayOnly {
+		return plan, false
+	}
+	plan.Tree = tree
+	return plan, false
+}
+
+func originBranchForTarget(root, baseRef, target string) string {
+	if target == "" {
+		return ""
+	}
+	if branch := normalizedOriginBranch(baseRef); branch != "" &&
+		gitOutput(root, "rev-parse", "--verify", "refs/remotes/origin/"+branch+"^{commit}") == target {
+		return branch
+	}
+	originHead := gitOutput(root, "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD")
+	if branch := normalizedOriginBranch(originHead); branch != "" &&
+		gitOutput(root, "rev-parse", "--verify", "refs/remotes/origin/"+branch+"^{commit}") == target {
+		return branch
+	}
+	out := gitOutput(root, "for-each-ref", "--contains="+target, "--sort=refname", "--format=%(refname)", "refs/remotes/origin")
+	for _, line := range strings.Split(out, "\n") {
+		if branch := normalizedOriginBranch(line); branch != "" {
+			return branch
+		}
+	}
+	return ""
+}
+
+func normalizedOriginBranch(ref string) string {
+	ref = strings.TrimSpace(ref)
+	switch {
+	case strings.HasPrefix(ref, "refs/remotes/origin/"):
+		ref = strings.TrimPrefix(ref, "refs/remotes/origin/")
+	case strings.HasPrefix(ref, "refs/heads/"):
+		ref = strings.TrimPrefix(ref, "refs/heads/")
+	case strings.HasPrefix(ref, "origin/"):
+		ref = strings.TrimPrefix(ref, "origin/")
+	}
+	if ref == "" || ref == "HEAD" {
+		return ""
+	}
+	cmd := exec.Command("git", "check-ref-format", "--branch", ref)
+	cmd.Env = repositoryGitEnvironment()
+	if err := cmd.Run(); err != nil {
+		return ""
+	}
+	return ref
+}
+
+func gitTargetRequiresOverlayOnly(root, target string) (bool, error) {
+	cmd := exec.Command("git", "ls-tree", "-r", "-z", "--full-tree", target)
+	cmd.Dir = root
+	cmd.Env = repositoryGitEnvironment()
+	out, err := cmd.Output()
+	if err != nil {
+		return false, err
+	}
+	var paths bytes.Buffer
+	for _, entry := range bytes.Split(out, []byte{0}) {
+		if len(entry) == 0 {
+			continue
+		}
+		metadata, name, ok := bytes.Cut(entry, []byte{'\t'})
+		if !ok {
+			return false, fmt.Errorf("parse target tree")
+		}
+		if bytes.HasPrefix(metadata, []byte("160000 ")) {
+			return true, nil
+		}
+		paths.Write(name)
+		paths.WriteByte(0)
+	}
+	if paths.Len() == 0 {
+		return false, nil
+	}
+	cmd = exec.Command("git", "check-attr", "--source="+target, "-z", "--stdin", "filter")
+	cmd.Dir = root
+	cmd.Env = repositoryGitEnvironment()
+	cmd.Stdin = bytes.NewReader(paths.Bytes())
+	out, err = cmd.Output()
+	if err != nil {
+		return false, err
+	}
+	fields := bytes.Split(out, []byte{0})
+	for i := 2; i < len(fields); i += 3 {
+		value := string(fields[i])
+		if value != "" && value != "unspecified" && value != "unset" {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func warnCredentialBearingGitSeed(w io.Writer) {
 	fmt.Fprintln(w, "warning: git seed disabled because origin URL contains embedded credentials; continuing with file sync without forwarding the remote URL")
 }
 
-func SyncExcludes(root string, cfg Config) ([]string, error) {
+func SyncExcludes(root string, cfg Config) (SyncExcludeRules, error) {
 	return syncExcludes(root, cfg)
 }
 
@@ -407,17 +803,6 @@ func gitOutput(root string, args ...string) string {
 	return strings.TrimSpace(string(out))
 }
 
-func remoteGitSeedCandidate(repo Repo) bool {
-	return remoteGitSeedSourceCandidate(repo) && !gitRemoteURLHasCredentials(repo.RemoteURL)
-}
-
-func remoteGitSeedSourceCandidate(repo Repo) bool {
-	if repo.Root == "" || repo.RemoteURL == "" || repo.Head == "" {
-		return false
-	}
-	return gitOutput(repo.Root, "for-each-ref", "--contains", repo.Head, "--format=%(refname)", "refs/remotes") != ""
-}
-
 func gitRemoteURLHasCredentials(remoteURL string) bool {
 	raw := strings.TrimSpace(remoteURL)
 	schemeEnd := strings.Index(raw, "://")
@@ -458,17 +843,17 @@ func defaultBaseRef(root string) string {
 	return ""
 }
 
-func syncFingerprintForManifest(repo Repo, cfg Config, manifest SyncManifest, excludes []string) (string, error) {
-	if repo.Head == "" {
+func syncFingerprintForManifest(repo Repo, cfg Config, manifest SyncManifest, excludes SyncExcludeRules, plan gitCoherencePlan) (string, error) {
+	if !plan.enabled() {
 		return "", nil
 	}
 	h := sha256.New()
-	fmt.Fprintf(h, "v3\nhead=%s\n", repo.Head)
+	fmt.Fprintf(h, "v5\nremote=%s\nbranch=%s\nhead=%s\ntree=%s\n", plan.RemoteURL, plan.Branch, plan.Target, plan.Tree)
 	fmt.Fprintf(h, "delete=%t\nchecksum=%t\n", cfg.Sync.Delete, cfg.Sync.Checksum)
 	fmt.Fprintf(h, "manifest=%x\n", sha256.Sum256(manifest.NUL()))
 	fmt.Fprintf(h, "deleted=%x\n", sha256.Sum256(manifest.DeletedNUL()))
-	for _, exclude := range excludes {
-		fmt.Fprintf(h, "exclude=%s\n", exclude)
+	for _, exclude := range excludes.rules {
+		fmt.Fprintf(h, "exclude=%d:%s\n", exclude.origin, exclude.pattern)
 	}
 	for _, rel := range manifest.Changed {
 		fmt.Fprintf(h, "path=%s\n", rel)
@@ -497,15 +882,62 @@ func syncFingerprintForManifest(repo Repo, cfg Config, manifest SyncManifest, ex
 }
 
 type SyncManifest struct {
-	Files        []string
-	Deleted      []string
-	Changed      []string
-	Bytes        int64
-	ChangedBytes int64
+	Files                    []string
+	Deleted                  []string
+	Changed                  []string
+	ProtectedTrackedExcludes []SyncProtectedTrackedExclude
+	Bytes                    int64
+	ChangedBytes             int64
 }
 
-func syncManifest(root string, excludes []string) (SyncManifest, error) {
-	return syncManifestFiltered(root, excludes, nil)
+type SyncProtectedTrackedExclude struct {
+	Path    string `json:"path"`
+	Pattern string `json:"pattern"`
+}
+
+// gitManifestError turns a raw git ls-files failure into an actionable,
+// workdir-aware diagnostic.
+func gitManifestError(root string, err error) error {
+	stderr := ""
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		stderr = strings.TrimSpace(string(exitErr.Stderr))
+	}
+	if isNotAGitRepoError(stderr) {
+		return fmt.Errorf("%s is not a Git repository: crabbox builds its sync manifest from Git; run `git init` here to sync files, or pass --no-sync to run without syncing local files", root)
+	}
+	if stderr != "" {
+		return fmt.Errorf("git ls-files in %s failed: %s", root, firstLine(stderr))
+	}
+	return fmt.Errorf("git ls-files in %s failed: %w", root, err)
+}
+
+func isNotAGitRepoError(stderr string) bool {
+	return strings.Contains(strings.ToLower(stderr), "not a git repository")
+}
+
+func gitSyncFileList(root string) ([]byte, error) {
+	if !explicitGitRepositoryRouting() {
+		boundary, err := nearestRepositoryBoundary(root, "")
+		if err != nil {
+			return nil, err
+		}
+		if boundary.kind == repositoryBoundaryNativeJujutsu {
+			return nil, fmt.Errorf("%s is a native Jujutsu workspace without colocated Git metadata: Crabbox sync is Git-manifest-based, and native Jujutsu sync is not supported yet because it risks syncing the wrong revision; use a colocated Git workspace instead (for example, from an existing Git checkout, initialize Jujutsu with `jj git init --git-repo=.`; this does not convert the current native workspace in place), or pass --no-sync to run without syncing local files", boundary.root)
+		}
+	}
+	cmd := exec.Command("git", "ls-files", "--cached", "--others", "--exclude-standard", "-z")
+	cmd.Dir = root
+	cmd.Env = repositoryGitEnvironment()
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, gitManifestError(root, err)
+	}
+	return out, nil
+}
+
+func syncManifest(root string, excludes SyncExcludeRules) (SyncManifest, error) {
+	return syncManifestFilteredRules(root, excludes, nil)
 }
 
 // syncManifestFiltered builds the sync manifest applying excludes and, when
@@ -513,18 +945,45 @@ func syncManifest(root string, excludes []string) (SyncManifest, error) {
 // synced. This lets a job sync a few selected paths instead of the whole working
 // tree (e.g. sync just `src/` and `scripts/` out of a large repo).
 func syncManifestFiltered(root string, excludes, includes []string) (SyncManifest, error) {
-	cmd := exec.Command("git", "ls-files", "--cached", "--others", "--exclude-standard", "-z")
-	cmd.Dir = root
-	cmd.Env = repositoryGitEnvironment()
-	out, err := cmd.Output()
+	return syncManifestFilteredRules(root, newSyncExcludeRules(excludes, syncExcludeConfigured), includes)
+}
+
+func syncManifestFilteredRules(root string, excludes SyncExcludeRules, includes []string) (SyncManifest, error) {
+	out, err := gitSyncFileList(root)
 	if err != nil {
 		return SyncManifest{}, err
+	}
+	tracked, err := loadGitTrackedPaths(root)
+	if err != nil {
+		return SyncManifest{}, fmt.Errorf("verify sync manifest scope: %w", err)
+	}
+	trackedRegular := trackedRegularPathSet(tracked)
+	inManifestScope := func(entry gitTrackedPath) bool {
+		rel := filepath.ToSlash(entry.name)
+		return safeRepoRel(rel) &&
+			!pathExcludedByRules(rel, excludes, gitModeIsRegular(entry.mode)) &&
+			pathIncluded(rel, includes)
+	}
+	gitlinkPaths, err := trackedGitlinkPaths(tracked, inManifestScope)
+	if err != nil {
+		return SyncManifest{}, fmt.Errorf("verify sync manifest scope: %w", err)
+	}
+	hidden, err := gitCheckoutHiddenOmissionForTracked(root, tracked, gitCheckoutSparseEnabled(root), func(entry gitTrackedPath) bool {
+		return entry.mode != "160000" && inManifestScope(entry)
+	}, sparseCheckoutIncludedPaths)
+	if err != nil {
+		return SyncManifest{}, fmt.Errorf("verify sync manifest scope: %w", err)
+	}
+	if hidden != "" {
+		return SyncManifest{}, fmt.Errorf("tracked path %q is hidden by sparse checkout or skip-worktree state but remains in sync manifest scope", hidden)
 	}
 	seen := map[string]bool{}
 	manifest := SyncManifest{}
 	for _, rel := range splitNul(out) {
 		rel = filepath.ToSlash(rel)
-		if !safeRepoRel(rel) || pathExcluded(rel, excludes) || !pathIncluded(rel, includes) || seen[rel] {
+		_, isTrackedRegular := trackedRegular[rel]
+		excluded, protectedPattern := pathExcludeDecision(rel, excludes, isTrackedRegular)
+		if _, isGitlink := gitlinkPaths[rel]; isGitlink || !safeRepoRel(rel) || excluded || !pathIncluded(rel, includes) || seen[rel] {
 			continue
 		}
 		full := filepath.Join(root, filepath.FromSlash(rel))
@@ -535,14 +994,29 @@ func syncManifestFiltered(root string, excludes, includes []string) (SyncManifes
 		seen[rel] = true
 		manifest.Files = append(manifest.Files, rel)
 		manifest.Bytes += info.Size()
+		if protectedPattern != "" {
+			manifest.ProtectedTrackedExcludes = append(manifest.ProtectedTrackedExcludes, SyncProtectedTrackedExclude{
+				Path:    rel,
+				Pattern: protectedPattern,
+			})
+		}
 	}
 	sort.Strings(manifest.Files)
-	deleted, err := syncDeletedPaths(root, excludes, includes)
+	sort.Slice(manifest.ProtectedTrackedExcludes, func(i, j int) bool {
+		return manifest.ProtectedTrackedExcludes[i].Path < manifest.ProtectedTrackedExcludes[j].Path
+	})
+	deleted, deletedGitlinks, deletedRegular, err := syncDeletedPaths(root, excludes, includes, trackedRegular)
 	if err != nil {
 		return SyncManifest{}, err
 	}
-	manifest.Deleted = filterDeletedPaths(deleted, seen)
-	changed, err := changedSyncPaths(root, excludes, includes)
+	for rel := range deletedGitlinks {
+		gitlinkPaths[rel] = struct{}{}
+	}
+	manifest.Deleted = filterDeletedPaths(deleted, seen, gitlinkPaths)
+	for rel := range deletedRegular {
+		trackedRegular[rel] = struct{}{}
+	}
+	changed, err := changedSyncPaths(root, excludes, includes, trackedRegular)
 	if err != nil {
 		return SyncManifest{}, err
 	}
@@ -550,8 +1024,56 @@ func syncManifestFiltered(root string, excludes, includes []string) (SyncManifes
 	return manifest, nil
 }
 
-func BuildSyncManifestFiltered(root string, excludes, includes []string) (SyncManifest, error) {
-	return syncManifestFiltered(root, excludes, includes)
+func trackedRegularPathSet(tracked []gitTrackedPath) map[string]struct{} {
+	paths := make(map[string]struct{})
+	for _, entry := range tracked {
+		if gitModeIsRegular(entry.mode) {
+			paths[filepath.ToSlash(entry.name)] = struct{}{}
+		}
+	}
+	return paths
+}
+
+func gitModeIsRegular(mode string) bool {
+	return mode == "100644" || mode == "100755"
+}
+
+func trackedGitlinkPaths(tracked []gitTrackedPath, inScope func(gitTrackedPath) bool) (map[string]struct{}, error) {
+	paths := make(map[string]struct{})
+	firstByPath := make(map[string]gitTrackedPath)
+	for _, entry := range tracked {
+		if inScope != nil && !inScope(entry) {
+			continue
+		}
+		rel := filepath.ToSlash(entry.name)
+		first, seen := firstByPath[rel]
+		if !seen {
+			firstByPath[rel] = entry
+			if entry.mode == "160000" {
+				paths[rel] = struct{}{}
+			}
+			continue
+		}
+		if (first.mode == "160000") == (entry.mode == "160000") {
+			continue
+		}
+		file, gitlink := first, entry
+		if first.mode == "160000" {
+			file, gitlink = entry, first
+		}
+		return nil, fmt.Errorf(
+			"tracked path %q has mixed file mode %s at stage %d and gitlink mode 160000 at stage %d in sync manifest scope",
+			rel,
+			file.mode,
+			file.stage,
+			gitlink.stage,
+		)
+	}
+	return paths, nil
+}
+
+func BuildSyncManifestFiltered(root string, excludes SyncExcludeRules, includes []string) (SyncManifest, error) {
+	return syncManifestFilteredRules(root, excludes, includes)
 }
 
 func (m SyncManifest) NUL() []byte {
@@ -572,29 +1094,51 @@ func (m SyncManifest) DeletedNUL() []byte {
 	return b.Bytes()
 }
 
-func syncDeletedPaths(root string, excludes, includes []string) ([]string, error) {
-	sets := [][]string{}
-	for _, args := range [][]string{
-		{"ls-files", "--deleted", "-z"},
-		{"diff", "--cached", "--name-only", "--diff-filter=D", "-z"},
-	} {
-		cmd := exec.Command("git", args...)
-		cmd.Dir = root
-		cmd.Env = repositoryGitEnvironment()
-		out, err := cmd.Output()
-		if err != nil {
-			return nil, err
-		}
-		sets = append(sets, splitNul(out))
+type gitCachedDeletion struct {
+	name         string
+	preimageMode string
+}
+
+func syncDeletedPaths(root string, excludes SyncExcludeRules, includes []string, trackedRegular map[string]struct{}) ([]string, map[string]struct{}, map[string]struct{}, error) {
+	cmd := exec.Command("git", "ls-files", "--deleted", "-z")
+	cmd.Dir = root
+	cmd.Env = repositoryGitEnvironment()
+	worktreeOut, err := cmd.Output()
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	cached, err := loadGitCachedDeletions(root)
+	if err != nil {
+		return nil, nil, nil, err
 	}
 	seen := map[string]bool{}
-	for _, set := range sets {
-		for _, rel := range set {
-			rel = filepath.ToSlash(rel)
-			if !safeRepoRel(rel) || pathExcluded(rel, excludes) || !pathIncluded(rel, includes) {
-				continue
-			}
+	gitlinks := map[string]struct{}{}
+	regular := map[string]struct{}{}
+	inScope := func(rel string, isRegular bool) bool {
+		return safeRepoRel(rel) && !pathExcludedByRules(rel, excludes, isRegular) && pathIncluded(rel, includes)
+	}
+	for _, rel := range splitNul(worktreeOut) {
+		rel = filepath.ToSlash(rel)
+		_, isRegular := trackedRegular[rel]
+		if inScope(rel, isRegular) {
 			seen[rel] = true
+			if isRegular {
+				regular[rel] = struct{}{}
+			}
+		}
+	}
+	for _, deletion := range cached {
+		rel := filepath.ToSlash(deletion.name)
+		isRegular := gitModeIsRegular(deletion.preimageMode)
+		if !inScope(rel, isRegular) {
+			continue
+		}
+		seen[rel] = true
+		if deletion.preimageMode == "160000" {
+			gitlinks[rel] = struct{}{}
+		}
+		if isRegular {
+			regular[rel] = struct{}{}
 		}
 	}
 	out := make([]string, 0, len(seen))
@@ -602,13 +1146,67 @@ func syncDeletedPaths(root string, excludes, includes []string) ([]string, error
 		out = append(out, rel)
 	}
 	sort.Strings(out)
-	return out, nil
+	return out, gitlinks, regular, nil
 }
 
-func filterDeletedPaths(deleted []string, files map[string]bool) []string {
+func loadGitCachedDeletions(root string) ([]gitCachedDeletion, error) {
+	cmd := exec.Command("git", "diff", "--cached", "--raw", "--format=", "-z", "--diff-filter=D", "--no-renames")
+	cmd.Dir = root
+	cmd.Env = repositoryGitEnvironment()
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, err
+	}
+	return parseGitCachedDeletions(out)
+}
+
+func trackedRegularPathSetWithCachedDeletions(root string, tracked []gitTrackedPath) (map[string]struct{}, error) {
+	paths := trackedRegularPathSet(tracked)
+	deletions, err := loadGitCachedDeletions(root)
+	if err != nil {
+		return nil, err
+	}
+	for _, deletion := range deletions {
+		if gitModeIsRegular(deletion.preimageMode) {
+			paths[filepath.ToSlash(deletion.name)] = struct{}{}
+		}
+	}
+	return paths, nil
+}
+
+func parseGitCachedDeletions(raw []byte) ([]gitCachedDeletion, error) {
+	if len(raw) > 0 && raw[len(raw)-1] != 0 {
+		return nil, fmt.Errorf("parse staged deletion metadata")
+	}
+	records := bytes.Split(raw, []byte{0})
+	if len(records) > 0 && len(records[len(records)-1]) == 0 {
+		records = records[:len(records)-1]
+	}
+	if len(records)%2 != 0 {
+		return nil, fmt.Errorf("parse staged deletion metadata")
+	}
+	deletions := make([]gitCachedDeletion, 0, len(records)/2)
+	for i := 0; i < len(records); i += 2 {
+		fields := bytes.Fields(records[i])
+		if len(fields) != 5 || len(fields[0]) < 2 || fields[0][0] != ':' || string(fields[4]) != "D" || len(records[i+1]) == 0 {
+			return nil, fmt.Errorf("parse staged deletion metadata")
+		}
+		mode := string(fields[0][1:])
+		if _, err := strconv.ParseUint(mode, 8, 32); err != nil {
+			return nil, fmt.Errorf("parse staged deletion mode %q", mode)
+		}
+		deletions = append(deletions, gitCachedDeletion{
+			name:         string(records[i+1]),
+			preimageMode: mode,
+		})
+	}
+	return deletions, nil
+}
+
+func filterDeletedPaths(deleted []string, files map[string]bool, gitlinks map[string]struct{}) []string {
 	out := deleted[:0]
 	for _, rel := range deleted {
-		if !files[rel] {
+		if _, isGitlink := gitlinks[rel]; !isGitlink && !files[rel] {
 			out = append(out, rel)
 		}
 	}
@@ -649,6 +1247,7 @@ func safeRepoRel(rel string) bool {
 func checkSyncPreflight(manifest SyncManifest, cfg Config, force bool, stderr io.Writer) error {
 	fileCount := len(manifest.Files)
 	guard := evaluateSyncGuardrail(manifest, cfg, force)
+	printProtectedTrackedExcludes(stderr, manifest)
 	if len(manifest.Changed) > 0 {
 		fmt.Fprintf(stderr, "sync candidate: %d files, %s dirty_delta=%d files, %s\n", fileCount, humanBytes(manifest.Bytes), len(manifest.Changed), humanBytes(manifest.ChangedBytes))
 	} else {
@@ -680,6 +1279,25 @@ func checkSyncPreflight(manifest SyncManifest, cfg Config, force bool, stderr io
 		printSyncTopDirs(stderr, guard.Paths)
 	}
 	return nil
+}
+
+func printProtectedTrackedExcludes(w io.Writer, manifest SyncManifest) {
+	if w == nil || len(manifest.ProtectedTrackedExcludes) == 0 {
+		return
+	}
+	limit := len(manifest.ProtectedTrackedExcludes)
+	if limit > protectedTrackedExcludeExampleLimit {
+		limit = protectedTrackedExcludeExampleLimit
+	}
+	items := make([]string, 0, limit)
+	for _, protected := range manifest.ProtectedTrackedExcludes[:limit] {
+		items = append(items, fmt.Sprintf("%s (%s)", protected.Path, protected.Pattern))
+	}
+	more := ""
+	if remaining := len(manifest.ProtectedTrackedExcludes) - limit; remaining > 0 {
+		more = fmt.Sprintf(" (+%d more)", remaining)
+	}
+	fmt.Fprintf(w, "warning: protected %d tracked files from built-in artifact excludes: %s%s\n", len(manifest.ProtectedTrackedExcludes), strings.Join(items, ", "), more)
 }
 
 type syncGuardrailEvaluation struct {
@@ -803,7 +1421,7 @@ func humanBytes(n int64) string {
 	return fmt.Sprintf("%.1f PiB", value/unit)
 }
 
-func changedSyncPaths(root string, excludes, includes []string) ([]string, error) {
+func changedSyncPaths(root string, excludes SyncExcludeRules, includes []string, trackedRegular map[string]struct{}) ([]string, error) {
 	sets := [][]string{}
 	for _, args := range [][]string{
 		{"diff", "--name-only", "-z"},
@@ -823,7 +1441,8 @@ func changedSyncPaths(root string, excludes, includes []string) ([]string, error
 	for _, set := range sets {
 		for _, rel := range set {
 			rel = filepath.ToSlash(rel)
-			if rel == "" || pathExcluded(rel, excludes) || !pathIncluded(rel, includes) {
+			_, isTrackedRegular := trackedRegular[rel]
+			if rel == "" || pathExcludedByRules(rel, excludes, isTrackedRegular) || !pathIncluded(rel, includes) {
 				continue
 			}
 			seen[rel] = true
@@ -852,15 +1471,35 @@ func splitNul(data []byte) []string {
 }
 
 func pathExcluded(rel string, excludes []string) bool {
+	rules := newSyncExcludeRules(excludes, syncExcludeConfigured)
+	excluded, _ := pathExcludeDecision(rel, rules, false)
+	return excluded
+}
+
+func pathExcludedByRules(rel string, rules SyncExcludeRules, trackedRegular bool) bool {
+	excluded, _ := pathExcludeDecision(rel, rules, trackedRegular)
+	return excluded
+}
+
+func pathExcludeDecision(rel string, rules SyncExcludeRules, trackedRegular bool) (bool, string) {
 	rel = filepath.ToSlash(rel)
 	excluded := false
-	for _, exclude := range excludes {
-		exclude, negated := excludeRule(exclude)
+	protectedPattern := ""
+	for _, rule := range rules.rules {
+		exclude, negated := excludeRule(rule.pattern)
 		if excludeMatches(rel, exclude) || protectedSyncExcludeMatches(rel, exclude) {
+			if trackedRegular && rule.origin == syncExcludeBuiltIn && !negated && isAmbiguousBuiltInExclude(rule.pattern) {
+				protectedPattern = exclude
+				continue
+			}
 			excluded = !negated
+			protectedPattern = ""
 		}
 	}
-	return excluded
+	if excluded {
+		protectedPattern = ""
+	}
+	return excluded, protectedPattern
 }
 
 func excludeRule(rule string) (pattern string, negated bool) {

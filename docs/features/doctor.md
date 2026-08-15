@@ -15,7 +15,11 @@ each check decides its status and how to add a new one.
 The command is fast (under a second on a healthy machine), non-destructive, and
 never calls billable provider create APIs. When a coordinator is configured it
 performs cheap broker checks such as health, identity, and provider secret
-readiness. The provider readiness probe is bounded to a 10s timeout.
+readiness. The provider readiness probe is bounded to a 10s timeout. Bare doctor
+is provider-neutral: it reports no selected provider, preserves
+`source=compiled_default selected=false` as compatibility metadata, and skips
+provider-specific tool and credential probes. All explicit or configured
+provider selections remain strict.
 
 ## Output Model
 
@@ -38,6 +42,7 @@ Check names you can see, roughly in emission order:
 ```text
 run        --from-run context summary (provider/target/lease/phase)
 config     writable config file exists with safe permissions (0600)
+provider-selection resolved provider and its winning selection source
 git        git is on PATH
 ssh        ssh is on PATH (SSH-backed providers)
 ssh-keygen ssh-keygen is on PATH (SSH-backed providers)
@@ -97,6 +102,19 @@ coordinator, doctor falls through to the direct provider check below.
 ## Provider Readiness (`provider`)
 
 Provider readiness validates the selected provider without creating a lease.
+
+Before local tool checks, `provider-selection` reports whether a provider is
+selected and the winning source: `compiled_default`, `user_config`, `repo_config`,
+`environment`, `flag`, `recorded_run`, or `lease_context`. This provenance is
+resolved while configuration and command context are applied; doctor does not
+infer it from the provider name.
+
+When the source is `compiled_default`, doctor reports `no provider selected`,
+sets selected=false, and skips provider-specific tools plus brokered and direct
+provider credential readiness. JSON keeps its top-level provider empty. Other
+provider-neutral checks still run and can fail the command. A provider
+selected from any higher-precedence source remains strict, including an
+explicit flag that happens to select the same provider as the compiled default.
 
 **Brokered path (coordinator configured).** For providers whose coordinator
 support is `supported` (`aws`, `azure`, `daytona`, `gcp`, `hetzner`), doctor asks
@@ -181,7 +199,8 @@ erroring.
 `crabbox doctor --from-run <run-id>` triages a recorded failure. Doctor fetches
 the run record and applies its provider, target, class, server type, lease, and
 phase before running diagnostics; it requires a configured coordinator (exit `2`
-otherwise). Older run records may omit fields — doctor then prints a
+otherwise). An explicit `--provider` keeps normal flag precedence over the
+recorded provider. Older run records may omit fields — doctor then prints a
 `warning run` line listing `missing=...` and skips checks that cannot be tied to
 the run, such as the remote probe when no lease ID was recorded.
 

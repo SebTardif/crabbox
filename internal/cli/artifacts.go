@@ -94,7 +94,7 @@ type artifactPublishOptions struct {
 func (a App) artifactsCollect(ctx context.Context, args []string) error {
 	defaults := defaultConfig()
 	fs := newFlagSet("artifacts collect", a.Stderr)
-	provider := fs.String("provider", defaults.Provider, "provider: hetzner, aws, or ssh")
+	provider := registerProviderSelectionFlag(fs, defaults, "provider: hetzner, aws, or ssh")
 	id := fs.String("id", "", "lease id or slug")
 	output := fs.String("output", "", "artifact bundle directory")
 	runID := fs.String("run", "", "optional run id whose retained logs should be copied")
@@ -682,7 +682,15 @@ func (a App) publishArtifactDirectory(ctx context.Context, opts artifactPublishO
 	}
 	body := artifactTemplateMarkdown(opts.Template, summary, "", "", published)
 	bodyPath := filepath.Join(opts.Directory, "published-artifacts.md")
-	if err := writeArtifactBundleFile(bundleRoot, "published-artifacts.md", []byte(body), 0o644); err != nil {
+	// artifactTemplateMarkdown embeds each file's URL. Restrict the summary only when one of
+	// those URLs is a presigned bearer capability; a public or local summary is meant to be
+	// shared, so it keeps the readable mode it has always had.
+	if artifactFilesContainSignedURL(published) {
+		err = writePrivateArtifactBundleFile(bundleRoot, "published-artifacts.md", []byte(body))
+	} else {
+		err = writeArtifactBundleFile(bundleRoot, "published-artifacts.md", []byte(body), 0o644)
+	}
+	if err != nil {
 		return nil, "", "", err
 	}
 	if opts.PR > 0 && !opts.NoComment {

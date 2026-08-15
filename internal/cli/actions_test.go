@@ -1,8 +1,10 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
+	"io"
 	"os"
 	"os/exec"
 	"path"
@@ -542,6 +544,50 @@ func TestSelectLocalHydrateJobAllowsSingleJobWorkflow(t *testing.T) {
 	}
 	if name != "setup" || job.Name != "Setup" {
 		t.Fatalf("selected job %q %#v, want setup", name, job)
+	}
+}
+
+func TestSyncLocalActionsWorkspaceUsesGitCoherenceFinalizer(t *testing.T) {
+	f := newGitCoherenceFixture(t)
+	tools := t.TempDir()
+	logPath := filepath.Join(tools, "ssh.log")
+	sshScript := `#!/bin/sh
+last=
+for arg do last="$arg"; done
+printf '%s\n' "$last" >> "$CRABBOX_ACTIONS_SSH_LOG"
+cat >/dev/null
+`
+	if err := os.WriteFile(filepath.Join(tools, "ssh"), []byte(sshScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tools, "rsync"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", tools+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("CRABBOX_ACTIONS_SSH_LOG", logPath)
+
+	cfg := baseConfig()
+	cfg.Sync.Fingerprint = true
+	cfg.Sync.BaseRef = "main"
+	repo := Repo{Root: f.source, Name: "repo", RemoteURL: f.origin, Head: f.b, BaseRef: "main"}
+	var stderr bytes.Buffer
+	app := App{Stdout: io.Discard, Stderr: &stderr}
+	err := app.syncLocalActionsWorkspace(context.Background(), cfg, repo, SSHTarget{
+		User: "crabbox", Host: "example.test", Port: "22", TargetOS: targetLinux,
+	}, "/work/repo")
+	if err != nil {
+		t.Fatalf("sync local Actions workspace: %v\n%s", err, stderr.String())
+	}
+	logData, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	log := string(logData)
+	plan := f.plan(t, f.b)
+	for _, want := range []string{plan.RemoteURL, plan.Target, plan.Tree, "refs/crabbox/sync-", "read-tree --reset", "update-ref --no-deref HEAD"} {
+		if !strings.Contains(log, want) {
+			t.Fatalf("Actions sync missing coherence contract %q:\n%s", want, log)
+		}
 	}
 }
 
@@ -1224,6 +1270,173 @@ func TestMissingRequiredWorkflowInputs(t *testing.T) {
 	}
 }
 
+func TestPrepareLocalActionsHydrationFreezesDispatchInputsAndScript(t *testing.T) {
+	root := t.TempDir()
+	workflowPath := filepath.Join(root, ".github", "workflows", "hydrate.yml")
+	if err := os.MkdirAll(filepath.Dir(workflowPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	workflow := `name: Hydrate
+on:
+  workflow_dispatch:
+    inputs:
+      crabbox_id:
+        required: true
+      crabbox_runner_label:
+        required: true
+      crabbox_keep_alive_minutes:
+        required: true
+      suite:
+        default: smoke
+jobs:
+  build:
+    steps:
+      - run: echo "${{ inputs.suite }}"
+`
+	if err := os.WriteFile(workflowPath, []byte(workflow), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := defaultConfig()
+	cfg.Actions.Workflow = ".github/workflows/hydrate.yml"
+	repo := Repo{Root: root, Name: "repo", Head: strings.Repeat("a", 40)}
+	fields := actionsHydrateFields("cbx_123", "crabbox-cbx-123", "legacy", 0, []string{"extra=value"})
+	plan, err := prepareLocalActionsHydration(cfg, repo, SSHTarget{}, "cbx_123", "legacy", fields)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.leaseID != "cbx_123" || plan.jobName != "build" || plan.expectedJob != "" {
+		t.Fatalf("unexpected plan identity: %#v", plan)
+	}
+	if want := remoteJoin(cfg, "cbx_123", "repo"); plan.workdir != want {
+		t.Fatalf("workdir=%q want %q", plan.workdir, want)
+	}
+	for _, want := range []string{"export INPUT_SUITE='smoke'", "does not declare input crabbox_job", "does not declare input extra"} {
+		if !strings.Contains(plan.script+plan.warnings, want) {
+			t.Fatalf("prepared plan missing %q:\nscript=%s\nwarnings=%s", want, plan.script, plan.warnings)
+		}
+	}
+	if strings.Contains(plan.script, "${{") {
+		t.Fatalf("prepared script retained expression:\n%s", plan.script)
+	}
+}
+
+func TestPrepareLocalActionsHydrationRejectsUnsupportedRenderedWorkflow(t *testing.T) {
+	tests := []struct {
+		name      string
+		step      string
+		actionYML string
+		want      string
+	}{
+		{name: "expression", step: `run: echo "${{ matrix.node }}"`, want: "does not support expression"},
+		{name: "non-composite local action", step: "uses: ./action", actionYML: "runs:\n  using: node20\n", want: "only supports repo-local composite actions"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := t.TempDir()
+			workflowPath := filepath.Join(root, ".github", "workflows", "hydrate.yml")
+			if err := os.MkdirAll(filepath.Dir(workflowPath), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			workflow := "jobs:\n  hydrate:\n    steps:\n      - " + tt.step + "\n"
+			if err := os.WriteFile(workflowPath, []byte(workflow), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if tt.actionYML != "" {
+				actionPath := filepath.Join(root, "action", "action.yml")
+				if err := os.MkdirAll(filepath.Dir(actionPath), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(actionPath, []byte(tt.actionYML), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			cfg := defaultConfig()
+			cfg.Actions.Workflow = ".github/workflows/hydrate.yml"
+			_, err := prepareLocalActionsHydration(cfg, Repo{Root: root, Name: "repo"}, SSHTarget{}, "cbx_123", "", nil)
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("error=%v want %q", err, tt.want)
+			}
+		})
+	}
+}
+
+func TestExecuteLocalActionsHydrationNormalizesConfigDerivedWSL2Target(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell ssh fixture")
+	}
+	dir := t.TempDir()
+	sshPath := filepath.Join(dir, "ssh")
+	logPath := filepath.Join(dir, "ssh.log")
+	hydratedPath := filepath.Join(dir, "hydrated")
+	sshScript := `#!/bin/sh
+remote=""
+for arg do remote="$arg"; done
+decoded="$remote"
+decode_base64() {
+  if [ "$(/usr/bin/uname -s)" = Darwin ]; then
+    /usr/bin/base64 -D
+  else
+    /usr/bin/base64 -d
+  fi
+}
+case "$remote" in
+  *" -EncodedCommand "*)
+    encoded=${remote##* }
+    outer=$(printf '%s' "$encoded" | decode_base64 | /usr/bin/iconv -f UTF-16LE -t UTF-8)
+    nested=$(printf '%s\n' "$outer" | /usr/bin/sed -n 's/.*FromBase64String("\([^"]*\)").*/\1/p' | /usr/bin/head -1)
+    if [ -n "$nested" ]; then
+      decoded=$(printf '%s' "$nested" | decode_base64)
+    else
+      decoded="$outer"
+    fi
+    ;;
+esac
+printf '%s\n---\n' "$decoded" >> "$CRABBOX_FAKE_SSH_LOG"
+case "$decoded" in
+  *"nohup"*) exit 42 ;;
+  *"timeout --signal=TERM"*) : > "$CRABBOX_FAKE_HYDRATED"; exit 0 ;;
+  *"cat"*".crabbox/actions/cbx_123.env"*)
+    if [ -e "$CRABBOX_FAKE_HYDRATED" ]; then
+      printf '%s\n' \
+        'WORKSPACE=/work/cbx_123/repo' \
+        'ENV_FILE=/home/crabbox/.crabbox/actions/cbx_123.env.sh'
+    fi
+    ;;
+esac
+/bin/cat >/dev/null || true
+exit 0
+`
+	if err := os.WriteFile(sshPath, []byte(sshScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("CRABBOX_FAKE_SSH_LOG", logPath)
+	t.Setenv("CRABBOX_FAKE_HYDRATED", hydratedPath)
+	cfg := defaultConfig()
+	cfg.TargetOS = targetWindows
+	cfg.WindowsMode = windowsModeWSL2
+	plan := localActionsHydrationPlan{
+		leaseID: "cbx_123",
+		workdir: "/work/cbx_123/repo",
+		jobName: "hydrate",
+		script:  "echo ok\n",
+	}
+	target := SSHTarget{User: "crabbox", Host: "127.0.0.1", Port: "22"}
+	app := App{Stdout: io.Discard, Stderr: io.Discard}
+	if _, err := app.executeLocalActionsHydration(context.Background(), cfg, Repo{Name: "repo"}, target, plan, time.Minute, false, false, nil); err != nil {
+		logData, _ := os.ReadFile(logPath)
+		t.Fatalf("%v\n%s", err, logData)
+	}
+	logData, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logText := string(logData)
+	if !strings.Contains(logText, "timeout --signal=TERM") || strings.Contains(logText, "nohup") {
+		t.Fatalf("config-derived WSL2 target used the wrong hydration path:\n%s", logText)
+	}
+}
+
 func TestLocalActionsHydrateScriptRejectsUnsupportedUses(t *testing.T) {
 	_, err := localActionsHydrateScript(defaultConfig(), Repo{Name: "repo"}, localHydrateWorkflow{}, localHydrateJob{
 		Steps: []localHydrateStep{{Uses: "docker/login-action@v3"}},
@@ -1395,6 +1608,46 @@ func TestRemoteClearActionsHydrationStateRemovesReadyAndStop(t *testing.T) {
 	}
 }
 
+func TestRemoteInvalidateActionsHydrationMarkerPreservesBookkeeping(t *testing.T) {
+	leaseID := "cbx_123"
+	bookkeepingPaths := []string{
+		actionsHydrationEnvPath(leaseID),
+		actionsHydrationServicesPath(leaseID),
+		actionsHydrationStopPath(leaseID),
+		actionsHydrationLocalScriptPath(leaseID),
+		actionsHydrationLocalLogPath(leaseID),
+		actionsHydrationLocalExitPath(leaseID),
+	}
+	t.Run("posix", func(t *testing.T) {
+		got := remoteInvalidateActionsHydrationMarkerForTarget(SSHTarget{TargetOS: targetLinux}, leaseID)
+		if !strings.Contains(got, actionsHydrationStatePath(leaseID)) {
+			t.Fatalf("invalidate command missing readiness marker:\n%s", got)
+		}
+		for _, path := range bookkeepingPaths {
+			if strings.Contains(got, path) {
+				t.Fatalf("invalidate command removes bookkeeping path %q:\n%s", path, got)
+			}
+		}
+	})
+	t.Run("windows", func(t *testing.T) {
+		target := SSHTarget{TargetOS: targetWindows, WindowsMode: windowsModeNormal}
+		got := decodePowerShellCommand(t, remoteInvalidateActionsHydrationMarkerForTarget(target, leaseID))
+		if !strings.Contains(got, windowsActionsHydrationPath(actionsHydrationStatePath(leaseID))) {
+			t.Fatalf("invalidate command missing readiness marker:\n%s", got)
+		}
+		for _, want := range []string{`$ErrorActionPreference = "Stop"`, "Test-Path -LiteralPath $path", "Remove-Item -LiteralPath $path -Force -ErrorAction Stop"} {
+			if !strings.Contains(got, want) {
+				t.Fatalf("invalidate command missing fail-closed operation %q:\n%s", want, got)
+			}
+		}
+		for _, path := range bookkeepingPaths {
+			if strings.Contains(got, windowsActionsHydrationPath(path)) {
+				t.Fatalf("invalidate command removes bookkeeping path %q:\n%s", path, got)
+			}
+		}
+	})
+}
+
 func TestRemoteWriteActionsHydrationStopMatchesWorkflowInput(t *testing.T) {
 	got := remoteWriteActionsHydrationStop("cbx_123")
 	for _, want := range []string{
@@ -1408,11 +1661,12 @@ func TestRemoteWriteActionsHydrationStopMatchesWorkflowInput(t *testing.T) {
 }
 
 func TestWindowsActionsHydrationMarkerCommandsUseProgramData(t *testing.T) {
-	target := SSHTarget{TargetOS: targetWindows, WindowsMode: windowsModeNormal}
+	target := targetWithConfigDefaults(SSHTarget{}, Config{TargetOS: targetWindows, WindowsMode: windowsModeNormal})
 	for name, command := range map[string]string{
-		"read":  remoteReadActionsHydrationStateForTarget(target, "cbx_123"),
-		"clear": remoteClearActionsHydrationStateForTarget(target, "cbx_123"),
-		"stop":  remoteWriteActionsHydrationStopForTarget(target, "cbx_123"),
+		"read":       remoteReadActionsHydrationStateForTarget(target, "cbx_123"),
+		"invalidate": remoteInvalidateActionsHydrationMarkerForTarget(target, "cbx_123"),
+		"clear":      remoteClearActionsHydrationStateForTarget(target, "cbx_123"),
+		"stop":       remoteWriteActionsHydrationStopForTarget(target, "cbx_123"),
 	} {
 		decoded := decodePowerShellCommand(t, command)
 		for _, want := range []string{`C:\ProgramData\crabbox\actions`, `cbx_123`} {
@@ -1447,7 +1701,6 @@ func TestLocalActionsRemoteCommandsQuoteLeasePaths(t *testing.T) {
 		want string
 	}{
 		"install":    {remoteInstallLocalActionsHydrateScript(leaseID), "\"$HOME\"/" + shellQuote(actionsHydrationLocalScriptPath(leaseID))},
-		"start":      {remoteStartLocalActionsHydrateScript(leaseID), "\"$HOME\"/" + shellQuote(actionsHydrationLocalLogPath(leaseID))},
 		"foreground": {remoteRunLocalActionsHydrateScriptForeground(leaseID, time.Minute), "\"$HOME\"/" + shellQuote(actionsHydrationLocalLogPath(leaseID))},
 		"status":     {remoteLocalActionsHydrateStatus(leaseID, "123"), "\"$HOME\"/" + shellQuote(actionsHydrationLocalExitPath(leaseID))},
 	} {
@@ -1457,6 +1710,63 @@ func TestLocalActionsRemoteCommandsQuoteLeasePaths(t *testing.T) {
 		if !strings.Contains(tc.got, tc.want) {
 			t.Fatalf("%s command missing quoted path %q:\n%s", name, tc.want, tc.got)
 		}
+	}
+	payload := remoteLocalActionsHydrateBackgroundPayload(leaseID)
+	wantLog := "\"$HOME\"/" + shellQuote(actionsHydrationLocalLogPath(leaseID))
+	if !strings.Contains(payload, wantLog) || !strings.Contains(remoteStartLocalActionsHydrateScript(leaseID), shellQuote(payload)) {
+		t.Fatalf("background hydrate command did not preserve nested path quoting:\npayload=%s\nstart=%s", payload, remoteStartLocalActionsHydrateScript(leaseID))
+	}
+}
+
+func TestActionsHydrationOwnerMonitorGeneration(t *testing.T) {
+	leaseID := "cbx_123"
+	ownerA := &workspaceOwner{key: strings.Repeat("a", 64), token: strings.Repeat("b", 64)}
+	ownerB := &workspaceOwner{key: ownerA.key, token: strings.Repeat("c", 64)}
+	markerA := actionsHydrationOwnerMonitorStopPath(leaseID, ownerA.token)
+	markerB := actionsHydrationOwnerMonitorStopPath(leaseID, ownerB.token)
+	if markerA == markerB {
+		t.Fatal("Actions owner monitor stop markers must be generation-specific")
+	}
+
+	posix := remoteActionsHydrationMonitorForTarget(SSHTarget{TargetOS: targetLinux}, leaseID, 90*time.Second, ownerB)
+	for _, want := range []string{actionsHydrationStatePath(leaseID), markerB, ownerB.key + ".owner", "state_expiry", "systemctl stop crabbox-actions-runner.service", "[R]unner.Worker", "exit 125"} {
+		if !strings.Contains(posix, want) {
+			t.Fatalf("POSIX owner monitor missing %q:\n%s", want, posix)
+		}
+	}
+	if strings.Contains(posix, markerA) {
+		t.Fatalf("POSIX generation B monitor watches generation A cancellation:\n%s", posix)
+	}
+	if cancelA := remoteCancelActionsHydrationMonitorForTarget(SSHTarget{TargetOS: targetLinux}, leaseID, ownerA); !strings.Contains(cancelA, markerA) || strings.Contains(cancelA, markerB) {
+		t.Fatalf("POSIX generation A cancellation is not isolated:\n%s", cancelA)
+	}
+	if prepareB := remotePrepareActionsHydrationMonitorForTarget(SSHTarget{TargetOS: targetLinux}, leaseID, ownerB); !strings.Contains(prepareB, markerB) || strings.Contains(prepareB, markerA) {
+		t.Fatalf("POSIX generation B preparation is not isolated:\n%s", prepareB)
+	}
+
+	windowsTarget := SSHTarget{TargetOS: targetWindows, WindowsMode: windowsModeNormal}
+	windows := decodePowerShellCommand(t, remoteActionsHydrationMonitorForTarget(windowsTarget, leaseID, 90*time.Second, ownerB))
+	for _, want := range []string{windowsActionsHydrationPath(actionsHydrationStatePath(leaseID)), windowsActionsHydrationPath(markerB), ownerB.key + ".owner", "Stop-CrabboxRunner", "Runner.Worker", "ToUnixTimeSeconds()", "exit 125"} {
+		if !strings.Contains(windows, want) {
+			t.Fatalf("Windows owner monitor missing %q:\n%s", want, windows)
+		}
+	}
+	if strings.Contains(windows, windowsActionsHydrationPath(markerA)) {
+		t.Fatalf("Windows generation B monitor watches generation A cancellation:\n%s", windows)
+	}
+	windowsCancelA := decodePowerShellCommand(t, remoteCancelActionsHydrationMonitorForTarget(windowsTarget, leaseID, ownerA))
+	if !strings.Contains(windowsCancelA, windowsActionsHydrationPath(markerA)) || strings.Contains(windowsCancelA, windowsActionsHydrationPath(markerB)) {
+		t.Fatalf("Windows generation A cancellation is not isolated:\n%s", windowsCancelA)
+	}
+	windowsPrepareB := decodePowerShellCommand(t, remotePrepareActionsHydrationMonitorForTarget(windowsTarget, leaseID, ownerB))
+	if !strings.Contains(windowsPrepareB, windowsActionsHydrationPath(markerB)) || strings.Contains(windowsPrepareB, windowsActionsHydrationPath(markerA)) {
+		t.Fatalf("Windows generation B preparation is not isolated:\n%s", windowsPrepareB)
+	}
+	if clear := remoteClearActionsHydrationState(leaseID); strings.Contains(clear, "owner-monitor-stop") {
+		t.Fatalf("broad POSIX hydration cleanup removed generation-specific monitor state:\n%s", clear)
+	}
+	if clear := decodePowerShellCommand(t, remoteClearActionsHydrationStateForTarget(windowsTarget, leaseID)); strings.Contains(clear, "owner-monitor-stop") {
+		t.Fatalf("broad Windows hydration cleanup removed generation-specific monitor state:\n%s", clear)
 	}
 }
 
@@ -1496,5 +1806,90 @@ func TestActionsRunURLIgnoresLocalRunIDs(t *testing.T) {
 	}
 	if got := actionsRunURL(repo, "123456"); got != "https://github.com/example-org/my-app/actions/runs/123456" {
 		t.Fatalf("actionsRunURL=%q", got)
+	}
+}
+
+func TestClearActionsHydrationStateRetriesTransientSSHTransportFailure(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell ssh fixture")
+	}
+	dir := t.TempDir()
+	sshPath := filepath.Join(dir, "ssh")
+	callsPath := filepath.Join(dir, "calls")
+	script := `#!/bin/sh
+printf 'call\n' >> "$CRABBOX_FAKE_SSH_CALLS"
+if [ "$(wc -l < "$CRABBOX_FAKE_SSH_CALLS")" -eq 1 ]; then
+  printf 'gateway temporarily unavailable\n' >&2
+  exit 255
+fi
+exit 0
+`
+	if err := os.WriteFile(sshPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("CRABBOX_FAKE_SSH_CALLS", callsPath)
+	originalDelay := idempotentSSHRetryDelay
+	idempotentSSHRetryDelay = 0
+	t.Cleanup(func() { idempotentSSHRetryDelay = originalDelay })
+
+	err := clearActionsHydrationState(context.Background(), SSHTarget{
+		User: "crabbox",
+		Host: "gateway.example",
+		Port: "22",
+	}, "cbx_123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls, err := os.ReadFile(callsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(string(calls), "call\n"); got != 2 {
+		t.Fatalf("ssh calls=%d want 2", got)
+	}
+}
+
+func TestClearActionsHydrationStateBoundsRetryAndRedactsDiagnostics(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell ssh fixture")
+	}
+	dir := t.TempDir()
+	sshPath := filepath.Join(dir, "ssh")
+	callsPath := filepath.Join(dir, "calls")
+	script := `#!/bin/sh
+printf 'call\n' >> "$CRABBOX_FAKE_SSH_CALLS"
+printf 'permission denied for opaque-access-token@gateway.example\n' >&2
+exit 255
+`
+	if err := os.WriteFile(sshPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("CRABBOX_FAKE_SSH_CALLS", callsPath)
+	originalDelay := idempotentSSHRetryDelay
+	idempotentSSHRetryDelay = 0
+	t.Cleanup(func() { idempotentSSHRetryDelay = originalDelay })
+
+	err := clearActionsHydrationState(context.Background(), SSHTarget{
+		User:       "opaque-access-token",
+		Host:       "gateway.example",
+		Port:       "22",
+		AuthSecret: true,
+	}, "cbx_123")
+	if err == nil {
+		t.Fatal("expected persistent transport failure")
+	}
+	if got := err.Error(); strings.Contains(got, "opaque-access-token") ||
+		!strings.Contains(got, "[redacted]@gateway.example") ||
+		!strings.Contains(got, "exit status 255") {
+		t.Fatalf("error=%q", got)
+	}
+	calls, readErr := os.ReadFile(callsPath)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if got := strings.Count(string(calls), "call\n"); got != 2 {
+		t.Fatalf("ssh calls=%d want 2", got)
 	}
 }

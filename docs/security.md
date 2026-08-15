@@ -97,7 +97,11 @@ by coordinator config:
 - `CRABBOX_GITHUB_ALLOWED_ORG` / `CRABBOX_GITHUB_ALLOWED_ORGS` restrict login to
   members of the listed GitHub org(s).
 - `CRABBOX_GITHUB_ALLOWED_TEAMS` (or `CRABBOX_GITHUB_ALLOWED_TEAM`) further
-  narrows access to selected team slugs after org membership passes.
+  narrows access to selected team slugs after org membership passes. The check is
+  scoped to the org being authorized, so a team in another configured org cannot
+  satisfy it; an org with teams configured but none of its own is rejected. Every
+  nonblank selector must be `team-slug` or `org/team-slug`; malformed paths, invalid
+  tokens, comma-only values, and mixed empty entries fail authorization closed.
 - `CRABBOX_GITHUB_MEMBERSHIP_CACHE_SECONDS` controls successful request-time
   membership caching (default 300, maximum 3600; set 0 to check every request).
 - `CRABBOX_GITHUB_REVOKED_USERS` immediately rejects comma-separated immutable
@@ -372,8 +376,8 @@ session.
 
 Configured provider credentials are redacted from documented HTTP or streamed
 error diagnostics, including Azure Dynamic Sessions, Cloudflare runner, Daytona,
-E2B, Freestyle, Islo, Morph, OpenComputer, Railway, RunPod, Semaphore, SmolVM,
-Sprites, and Upstash Box. The same final redaction covers `doctor` text and JSON
+DigitalOcean, E2B, FastAPI Cloud, Freestyle, Islo, Morph, OpenComputer, Orgo,
+Railway, RunPod, Semaphore, SmolVM, Sprites, and Upstash Box. The same final redaction covers `doctor` text and JSON
 messages/details. It removes exact configured secrets, authorization and API-key
 headers, credential-bearing URL query/userinfo components, common secret JSON
 fields, bearer values, and PEM private keys while retaining non-secret routing
@@ -425,7 +429,16 @@ S3, R2, or Cloudflare uploads, so later bundle path replacement cannot change
 uploaded bytes. Local and dry-run manifests hash through rooted validated file
 handles without duplicating the bundle. Generated manifest and Markdown files
 replace reserved outputs through root-confined temporary files without
-following symlinks. Required artifact paths must resolve to regular files.
+following symlinks. Manifests and summaries that contain signed bearer URLs are
+restricted to the current OS user before their sensitive bytes are written and
+are verified before publication: mode `0600` on POSIX, with inherited macOS
+ACLs removed, and a protected, current-user-owned DACL with no unrelated grants
+on Windows. Public-URL and local-path artifact outputs retain their shareable
+permissions. The same local
+private-file boundary protects Crabbox-generated run outputs and the managed
+attestation signing key; replacement or reuse tightens an older broad mode or
+DACL instead of preserving it. Required artifact paths must resolve to regular
+files.
 Automatic remote failure bundles confine member names and link targets to their
 generated subtree and omit
 escaping, rooted, empty, or special-file entries. These filesystem checks do
@@ -498,8 +511,14 @@ Homebrew tap. The source identity is an annotated `vMAJOR.MINOR.PATCH` tag whose
 signature verifies against the repository-pinned signer policy. Verification
 captures the exact tag-object and peeled commit IDs, confirms the remote tag has
 not moved, and requires the peeled commit to be an ancestor of protected
-`main`. Existing valid tags are preserved when release hardening lands later;
-they are never rewritten to point at verifier code.
+`main`. Protected `main` grants the release-admin team a PR-only approval
+bypass, so release admins can merge their own release PRs without gaining a
+direct-push path. Separate no-bypass rules protect branch history and stable
+release tags. The required release snapshot workflow is loaded from protected
+`openclaw/release-workflows` rather than Crabbox, so a Crabbox pull request
+cannot weaken the check that gates its own merge. Existing valid tags are
+preserved when release hardening lands later; they are never rewritten to point
+at verifier code.
 
 Release orchestration and verification come from the exact protected-default
 workflow commit, not from the tagged candidate. Trusted and candidate trees are
@@ -665,8 +684,8 @@ Layered protections:
 - Explicit release (`crabbox stop` / `release`).
 - A Durable Object alarm or pg-boss job that expires leases and reschedules the
   next pending deadline, plus periodic reconciliation.
-- A coordinator-side AWS orphan sweep over current broker credentials and
-  capacity regions.
+- Coordinator-side AWS and Azure orphan sweeps over current broker credentials
+  and configured provider scopes.
 - A provider-label sweep for clearly expired, inactive orphan machines.
 
 In direct-CLI mode, cleanup runs from the CLI using provider labels: it skips
@@ -680,11 +699,9 @@ Provider tags discover candidates and explain why they look stale, but do not
 authorize a destructive action. Automatic AWS or Azure deletion requires an
 exact retained coordinator lease binding for the same provider resource and
 region; EC2 Mac host release likewise requires an exact retained host binding.
-Before coordinator Azure cleanup deletes a VM, it also persists the managed
-disk's immutable ID while the live `managedBy` association still matches that
-VM. Later disk deletion revalidates that identity and any current attachment;
-an interrupted cleanup may continue after the VM is gone without trusting
-self-written tags, while missing or mismatched claims fail closed.
+Azure's canonical-set, topology, stable-identity, quarantine, and fresh-preflight
+rules are maintained in [Lifecycle and cleanup](features/lifecycle-cleanup.md);
+shared VNets, subnets, NSGs, and resource groups are never sweep candidates.
 Tag-only and legacy candidates remain report-only. Sweeps skip `keep=true`
 resources and apply a grace window before reporting missing labels or stale
 lease mappings.

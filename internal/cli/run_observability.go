@@ -513,6 +513,8 @@ var preflightToolRegistry = map[string]preflightToolSpec{
 	"npm":              {Posix: []string{"npm", "--version"}, Windows: []string{"npm", "--version"}},
 	"pnpm":             {Posix: []string{"pnpm", "--version"}, Windows: []string{"pnpm", "--version"}},
 	"powershell":       {Windows: []string{"$PSVersionTable.PSVersion.ToString()"}, OS: map[string]bool{"windows": true}},
+	"python":           {Posix: []string{"python", "--version"}, Windows: []string{"python", "--version"}},
+	"python3":          {Posix: []string{"python3", "--version"}, Windows: []string{"python3", "--version"}},
 	"pwsh":             {Windows: []string{"pwsh", "--version"}, OS: map[string]bool{"windows": true}},
 	"sudo":             {OS: map[string]bool{"linux": true, "macos": true}},
 	"tar":              {Posix: []string{"tar", "--version"}, Windows: []string{"tar", "--version"}},
@@ -643,6 +645,7 @@ type FailureCaptureMetadata struct {
 	LeaseID        string
 	Slug           string
 	RunID          string
+	CommandDisplay string
 	Workdir        string
 	ExitCode       int
 	ActionsRunURL  string
@@ -763,11 +766,18 @@ func writeLocalFailureBundle(name, remoteTarPath string, meta FailureCaptureMeta
 }
 
 func addFailureBundleMetadata(tw *tar.Writer, meta FailureCaptureMetadata) error {
+	commandSecrets := configuredDiagnosticSecrets(meta.Config)
+	for _, value := range meta.Env {
+		if strings.TrimSpace(value) != "" {
+			commandSecrets = append(commandSecrets, value)
+		}
+	}
 	run := map[string]any{
 		"provider":          meta.Provider,
 		"leaseId":           meta.LeaseID,
 		"slug":              meta.Slug,
 		"runId":             meta.RunID,
+		"command":           RedactDiagnosticSecrets(meta.CommandDisplay, commandSecrets...),
 		"workdir":           meta.Workdir,
 		"exitCode":          meta.ExitCode,
 		"actionsRunUrl":     meta.ActionsRunURL,

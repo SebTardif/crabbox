@@ -14,7 +14,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/openclaw/crabbox/internal/providers/shared"
 )
@@ -144,7 +143,7 @@ var newAPI = func(cfg Config, rt Runtime) (api, error) {
 	// appears, the transport can be swapped behind the api interface.
 	httpClient := rt.HTTP
 	if httpClient == nil {
-		httpClient = &http.Client{Timeout: 60 * time.Second}
+		httpClient = http.DefaultClient
 	}
 	base := blank(strings.TrimSpace(cfg.Smolvm.BaseURL), "https://api.smolmachines.com")
 	parsed, err := url.Parse(base)

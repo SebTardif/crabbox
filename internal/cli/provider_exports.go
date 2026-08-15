@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"time"
 )
@@ -14,6 +15,12 @@ func BaseConfig() Config {
 
 func LoadConfig() (Config, error) {
 	return loadConfig()
+}
+
+// ProviderSelectionIsAuthoritativeRoute reports whether cfg names an exact
+// provider restored from lease or recorded-run context.
+func ProviderSelectionIsAuthoritativeRoute(cfg Config) bool {
+	return providerSelectionIsAuthoritativeRoute(cfg)
 }
 
 func NormalizeTargetConfig(cfg *Config) {
@@ -241,6 +248,10 @@ func ReplaceLeaseClaimIfUnchangedDurableReturning(leaseID string, current, repla
 	return replaceLeaseClaimIfUnchangedDurableReturning(leaseID, current, replacement)
 }
 
+func ReplaceLeaseClaimIfUnchangedDurableAfter(leaseID string, current, replacement LeaseClaim, action func() error) (LeaseClaim, error) {
+	return replaceLeaseClaimIfUnchangedDurableAfter(leaseID, current, replacement, action)
+}
+
 func ValidateAzureSSHCIDRsForAcquire(ctx context.Context, cfg Config) error {
 	_, err := azureSSHCIDRsForRules(ctx, cfg, nil)
 	return err
@@ -274,6 +285,12 @@ func UpdateLeaseClaimEndpointIfUnchangedAfter(leaseID string, expected LeaseClai
 
 func WithLeaseClaimUnchanged(leaseID string, expected LeaseClaim, action func() error) error {
 	return withLeaseClaimUnchanged(leaseID, expected, action)
+}
+
+// WithDurableLeaseClaimLock serializes a provider operation on the existing
+// claim lock and exposes explicit durable checkpoints before side effects.
+func WithDurableLeaseClaimLock(leaseID string, action func(*LeaseClaim, bool, func() error) error) error {
+	return withDurableLeaseClaimLock(leaseID, action)
 }
 
 func ResolveLeaseClaimAfterActionIfUnchanged(
@@ -365,6 +382,14 @@ func ServerLeaseClaimSnapshot(server Server) (LeaseClaim, bool, bool) {
 
 func OSImageWasExplicit(cfg Config) bool {
 	return cfg.osImageExplicit
+}
+
+func ImageRequirementsIntent(cfg Config) (string, error) {
+	data, err := json.Marshal(cfg.imageRequirements)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
 }
 
 func ClassWasExplicit(cfg Config) bool {

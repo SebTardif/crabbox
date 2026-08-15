@@ -3,7 +3,8 @@
 Read this when:
 
 - changing how leases are released or expired;
-- debugging leaked provider resources (instances, disks, Mac hosts);
+- debugging leaked provider resources (instances, NICs, public IPs, disks, Mac
+  hosts);
 - changing direct-provider cleanup behavior.
 
 A lease holds a remote box until it is released or expires. Two independent
@@ -77,6 +78,56 @@ Mac dedicated hosts only when retained coordinator state binds the exact
 resource; tag-only and legacy candidates stay report-only. It runs from the same
 alarm/cron, gated by `CRABBOX_AWS_ORPHAN_SWEEP_*` environment variables.
 
+### Azure orphan sweep
+
+The coordinator's Azure sweep uses a reconciliation-specific inventory of the
+configured resource group across canonical per-lease VMs, NICs, public IPs, and
+managed OS disks. The ordinary VM list/pool path remains VM-only. The sweep can
+group a complete exact-owned NIC, public IP, and managed-disk set even when an
+interrupted provisioning attempt left no VM.
+
+An exact group must retain consistent Crabbox ownership tags, location,
+canonical topology, and stable Azure resource identities. Mixed or incomplete
+groups remain report-only. VMs with any data disk are also report-only because
+VM deletion can cascade through data-disk delete options. VM managed-disk,
+VM-to-NIC, and NIC-to-public-IP cascade-delete options are likewise rejected and
+fingerprinted. A change to the member set, ownership labels, location, topology,
+or stable identity changes the reconciliation fingerprint and resets the grace
+quarantine. Ordinary release still supports a verified VM/NIC/public-IP set
+whose OS disk is explicitly ephemeral (`diffDiskSettings.option=Local`); the
+managed-disk orphan sweep keeps that non-managed shape report-only.
+
+Delete mode releases only a group bound to an exact retained coordinator lease
+after the same complete resource identity has survived the grace period and two
+successful authoritative inventories. The normal owned-resource delete path
+performs a fresh preflight before each deletion. Shared VNets, subnets, NSGs,
+and resource groups are not part of the inventory or deletion path. With all
+four Azure broker credentials configured, the sweep is enabled unless
+`CRABBOX_AZURE_ORPHAN_SWEEP_ENABLED=0`; set
+`CRABBOX_AZURE_ORPHAN_SWEEP_DELETE=1` to allow deletion. Its interval and grace
+default to 3600 and 900 seconds and are controlled by
+`CRABBOX_AZURE_ORPHAN_SWEEP_INTERVAL_SECONDS` and
+`CRABBOX_AZURE_ORPHAN_SWEEP_GRACE_SECONDS`.
+
+Durable owned-delete claims persist each successful member deletion with that
+member's stable resource identity before cleanup advances. A missing member is
+accepted on retry only when the same claim contains that exact ordered progress;
+an external disappearance or failed progress write stops the remaining cleanup.
+Progress updates transactionally merge the longest verified prefix so concurrent
+cleanup attempts cannot overwrite newer evidence. Fresh preflight also compares
+the quarantined ownership labels, including `keep` and expiry, on every survivor.
+New cleanup starts with a transactional version-2 preparing reservation, then
+binds the complete inspected identity before the first deletion. Every later
+claim transition and completed-claim clear is transactional, so a delayed
+preparation, replacement, or empty-set observer cannot overwrite or erase newer
+progress. Older workers reject version-2 claims rather than replaying them with
+version-1 semantics. Legacy version-1 claims still
+replay through the same scope and topology checks, but a
+legacy partial claim with an unexplained missing member fails closed because it
+cannot prove which cleanup deleted that member. A legacy claim can establish a
+new stable baseline only while the VM, NIC, public IP, and managed disk are all
+still present; an already-empty legacy claim can be cleared without mutation.
+
 ## Direct-provider lifecycle
 
 Without a coordinator, the CLI talks to the provider API directly and owns
@@ -133,6 +184,15 @@ so repo-local wrappers do not need their own ledger. Commands that reuse a lease
 validate that the current repo matches the claim; deleting a lease removes its
 claim. Move a claim to a different repo deliberately with `--reclaim`. See
 [Identifiers](identifiers.md) for the claim file format and location.
+
+Providers may durably publish an exact-resource claim with the generic
+`state=provisioning` label before post-create readiness completes. Such a claim
+is recovery authority, not proof that the lease is ready: inventory and status
+must keep it non-ready until a fenced claim update records `state=ready`.
+Provider adapters own the immutable resource identity and routing scope needed
+to inspect or delete that pending resource. Cleanup must compare the unchanged
+claim under its lifecycle fence before mutation so an old readiness or cleanup
+attempt cannot overwrite or delete a newer claim.
 
 ## Related docs
 

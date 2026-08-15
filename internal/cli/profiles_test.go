@@ -470,12 +470,35 @@ func TestRenderRunProofUsesTemplateAndLiveOutput(t *testing.T) {
 	for _, want := range []string{
 		"## Real behavior proof",
 		"Behavior addressed: Live QA login-regression",
-		"Evidence after fix: Copied live console output from Crabbox `run_123`",
+		"Exact steps or command run:",
+		"Evidence: Copied live console output from Crabbox `run_123`",
+		"Observed result: The scenario passed.",
 		"scenario pass login-regression 33.8s",
 		"What was not tested: No public service.",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("proof missing %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestRenderRunProofUsesContextNeutralDefaultLabels(t *testing.T) {
+	got, err := renderRunProof(proofRenderInput{Command: "make test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"Exact steps or command run:",
+		"Evidence: Copied live console output from Crabbox",
+		"Observed result: The command completed successfully on the remote environment.",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("proof missing %q:\n%s", want, got)
+		}
+	}
+	for _, forbidden := range []string{"after this patch", "after fix"} {
+		if strings.Contains(got, forbidden) {
+			t.Fatalf("proof contains patch-specific claim %q:\n%s", forbidden, got)
 		}
 	}
 }
@@ -512,6 +535,68 @@ func TestRenderRunProofUsesSafeMarkdownFence(t *testing.T) {
 	}
 	if !strings.Contains(got, "````text\nbefore\n```text\nnested\n```\nafter\n````") {
 		t.Fatalf("proof did not use a safe fence:\n%s", got)
+	}
+}
+
+func TestRenderRunProofIncludesCaptureMetadataWithoutCapturedContent(t *testing.T) {
+	unsafePath := "captures/stdout`\n# forged heading\x1b.md"
+	got, err := renderRunProof(proofRenderInput{
+		Provider:   "aws",
+		LeaseID:    "cbx_123",
+		Command:    "make test",
+		LogExcerpt: "live stderr remains",
+		Captures: []streamCaptureMetadata{
+			{Label: "stdout", Path: unsafePath, Bytes: 19},
+			{Label: "stderr", Path: "captures/stderr.bin", Bytes: 7},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"live stderr remains",
+		`captured stream=stdout path="captures/stdout\x60\x0a\x23 forged heading\x1b.md" bytes=19`,
+		`captured stream=stderr path="captures/stderr.bin" bytes=7`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("proof missing %q:\n%s", want, got)
+		}
+	}
+	for _, forbidden := range []string{"stdout`", "\n# forged heading", "\x1b"} {
+		if strings.Contains(got, forbidden) {
+			t.Fatalf("proof contains unsafe capture path fragment %q:\n%s", forbidden, got)
+		}
+	}
+}
+
+func TestRenderRunProofUsesCaptureMetadataInsteadOfNoOutputSentinel(t *testing.T) {
+	got, err := renderRunProof(proofRenderInput{
+		LogExcerpt: "(no console output captured)",
+		Captures: []streamCaptureMetadata{
+			{Label: "stdout", Path: "/tmp/stdout.bin", Bytes: 0},
+			{Label: "stderr", Path: "/tmp/stderr.bin", Bytes: 12},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdout := `captured stream=stdout path="/tmp/stdout.bin" bytes=0`
+	stderr := `captured stream=stderr path="/tmp/stderr.bin" bytes=12`
+	if !strings.Contains(got, stdout+"\n"+stderr) {
+		t.Fatalf("capture metadata order is not deterministic:\n%s", got)
+	}
+	if strings.Contains(got, "(no console output captured)") {
+		t.Fatalf("proof kept no-output sentinel with explicit captures:\n%s", got)
+	}
+}
+
+func TestRenderRunProofKeepsNoOutputSentinelWithoutCaptures(t *testing.T) {
+	got, err := renderRunProof(proofRenderInput{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got, "(no console output captured)") {
+		t.Fatalf("proof lost no-output sentinel:\n%s", got)
 	}
 }
 

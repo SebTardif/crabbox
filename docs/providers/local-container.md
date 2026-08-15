@@ -87,6 +87,21 @@ When `runtime` is unset or left at `docker`, Crabbox detects an installed
 container CLI. If both `docker` and `podman` are available, `docker` is selected
 unless `runtime` is set explicitly.
 
+### Memory-failure evidence
+
+For every user command, Local Container reads the container cgroup OOM-kill
+counter immediately before execution. After a nonzero exit or SSH transport
+failure, it reads the counter again. Only a positive increment for that command
+is reported as `resource_exhaustion=memory`; an OOM from an earlier command on a
+reused lease does not classify a later ordinary failure. Docker/Podman cgroup
+paths and counter parsing remain inside this provider.
+
+The failure digest marks this condition non-retryable with the unchanged
+configuration and suggests increasing `localContainer.memory` (or
+`--local-container-memory`) or reducing workload concurrency. If cgroup evidence
+cannot be read, Crabbox prints a diagnostic warning and preserves the original
+command failure and ordinary user-command classification.
+
 Provider flags:
 
 ```text
@@ -173,22 +188,51 @@ metadata updates.
 2. The provider runs `docker run -d` with Crabbox labels, loopback SSH port
    publishing, and the public-key auth environment the bootstrap script needs.
 3. On Debian/Ubuntu-compatible images, the container installs
-   `openssh-server`, `git`, `rsync`, `curl`, and `sudo` when they are missing.
+   `openssh-server`, `git`, `rsync`, `curl`, and `sudo` when they are missing,
+   then restores the selected image's declared `PATH` before each managed SSH
+   login profile. Profiles added after bootstrap can prepend to or intentionally
+   replace that baseline; the profile selected during bootstrap keeps its final
+   managed restore block.
 4. With `--desktop`, the container installs and starts Xvfb, XFCE, x11vnc,
    xdotool, screenshot tools, ffmpeg, noVNC, and websockify — no systemd
    required.
 5. With `--browser`, the container installs a real package-manager browser where
    the image provides one and writes `/var/lib/crabbox/browser.env`.
-6. Crabbox waits for SSH readiness, syncs tracked and non-ignored files into
+6. As soon as the runtime returns an exact container ID, before the first
+   inspect or readiness probe, Crabbox durably records a `state=provisioning`
+   claim bound to that ID, the runtime context/endpoint/daemon identity, SSH
+   key, bootstrap directory, and host-work-root ownership. Later inspect and
+   endpoint discoveries are compare-and-swap claim transitions. The claim
+   changes to `state=ready` only after the SSH readiness check succeeds.
+7. Crabbox syncs tracked and non-ignored files into
    `localContainer.workRoot`, then drives the command over the normal SSH
    executor.
-7. `status`, `list`, and `stop` inspect or remove labeled containers.
-8. `cleanup --provider docker` removes stopped containers and running
+8. `status`, `list`, and `stop` inspect or remove labeled containers.
+9. `cleanup --provider docker` removes stopped containers and running
    non-`keep` containers whose local claim or lease labels are stale past the
    idle timeout plus a safety grace period.
-9. If a local claim remains after its container was removed outside Crabbox,
+10. If a local claim remains after its container was removed outside Crabbox,
    `crabbox stop --provider docker <lease-or-slug>` removes the stale claim and
    stored SSH key.
+
+When `warmup` or `run --keep` creates the container but SSH readiness is
+canceled, fails, or times out, Crabbox keeps the exact pending claim, container,
+key, and bootstrap directory. The failed command prints copyable, runtime-scoped
+`inspect`, `run --reclaim --sync-only`, and `stop` commands. Pending claims stay
+visible in inventory as `provisioning` (or `missing` with a provisioning label
+if the container disappeared) and never report ready. `stop` accepts the exact
+pending claim without requiring a successful intervening run and fences the
+container deletion against concurrent claim changes. The provider cleanup sweep
+leaves a missing keep-enabled pending claim for explicit recovery or `stop`
+instead of discarding its ownership evidence; a missing non-keep pending claim
+is fenced and removed with its key and bootstrap state. Fresh one-shot runs and
+`warmup --keep=false` still remove the container, key, bootstrap directory, and
+claim when readiness does not complete.
+
+Named Docker contexts and Podman connections are included in those recovery
+commands. Custom runtime endpoints remain private in the local claim rather
+than being printed; exact-ID commands hydrate that route from the claim before
+their first runtime lookup and reject a changed endpoint or daemon identity.
 
 ## Limits and caveats
 

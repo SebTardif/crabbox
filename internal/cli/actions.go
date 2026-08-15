@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net/url"
@@ -14,6 +15,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -32,11 +34,11 @@ func (r GitHubRepo) Slug() string {
 	return r.Owner + "/" + r.Name
 }
 
-func (a App) actionsHydrate(ctx context.Context, args []string) error {
+func (a App) actionsHydrate(ctx context.Context, args []string) (err error) {
 	started := time.Now()
 	defaults := defaultConfig()
 	fs := newFlagSet("actions hydrate", a.Stderr)
-	provider := fs.String("provider", defaults.Provider, providerHelpAll())
+	provider := registerProviderSelectionFlag(fs, defaults, providerHelpAll())
 	providerFlags := registerProviderFlags(fs, defaults)
 	targetFlags := registerTargetFlags(fs, defaults)
 	networkFlags := registerNetworkModeFlag(fs, defaults)
@@ -137,6 +139,23 @@ func (a App) actionsHydrate(ctx context.Context, args []string) error {
 	if err := waitForSSHReady(ctx, &target, a.Stderr, "actions hydrate", 2*time.Minute); err != nil {
 		return err
 	}
+	ownerParentCtx := ctx
+	owner, err := acquireWorkspaceOwner(ctx, target, leaseID, a.Stderr)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ownerParentCtx), 30*time.Second)
+		closeErr := owner.Close(releaseCtx)
+		cancel()
+		if closeErr != nil {
+			err = errors.Join(err, closeErr)
+			fmt.Fprintf(a.Stderr, "warning: workspace owner release failed: %v\n", closeErr)
+			return
+		}
+		fmt.Fprintln(a.Stderr, "workspace owner released")
+	}()
+	ctx = contextWithWorkspaceOwner(owner.Context(), owner)
 	if _, err := updateLeaseClaimEndpointIfUnchanged(leaseID, ownedClaim, server, target); err != nil {
 		return err
 	}
@@ -146,7 +165,10 @@ func (a App) actionsHydrate(ctx context.Context, args []string) error {
 		return err
 	}
 	if coord := backendCoordinator(backend); coord != nil {
-		stopHeartbeat := startCoordinatorHeartbeat(ctx, coord, leaseID, cfg.IdleTimeout, nil, leaseTelemetryCollectorForTarget(target), a.Stderr)
+		stopHeartbeat, err := startCoordinatorHeartbeat(ctx, coord, leaseID, cfg.Provider, cfg.IdleTimeout, nil, leaseTelemetryCollectorForTarget(target), a.Stderr)
+		if err != nil {
+			return err
+		}
 		defer stopHeartbeat()
 	} else if sshBackend, ok := backend.(SSHLeaseBackend); ok {
 		_, err := sshBackend.Touch(ctx, TouchRequest{Lease: LeaseTarget{Server: server, SSH: target, LeaseID: leaseID}, State: blank(server.Labels["state"], "ready"), IdleTimeout: cfg.IdleTimeout})
@@ -160,7 +182,7 @@ func (a App) actionsHydrate(ctx context.Context, args []string) error {
 	fields := actionsHydrateFields(leaseID, label, cfg.Actions.Job, *keepAliveMinutes, extraFields)
 	if !*githubRunner {
 		localFields := actionsHydrateFields(leaseID, label, cfg.Actions.Job, 0, extraFields)
-		if state, err := a.hydrateActionsLocally(ctx, cfg, repo, target, leaseID, cfg.Actions.Job, localFields, *waitTimeout, true, true); err == nil {
+		if state, err := a.hydrateActionsLocally(ctx, cfg, repo, target, leaseID, cfg.Actions.Job, localFields, *waitTimeout, true, true, owner); err == nil {
 			fmt.Fprintf(a.Stdout, "actions hydrated local id=%s slug=%s workspace=%s run_id=%s\n", leaseID, blank(slug, "-"), state.Workspace, blank(state.RunID, "-"))
 			fmt.Fprintf(a.Stdout, "actions hydrate complete total=%s\n", time.Since(started).Round(time.Millisecond))
 			if *timingJSON {
@@ -184,7 +206,7 @@ func (a App) actionsHydrate(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	state, err := a.hydrateActionsWithGitHubRunner(ctx, cfg, repo, target, leaseID, slug, ghRepo, label, ref, fields, *waitTimeout)
+	state, err := a.hydrateActionsWithGitHubRunner(ctx, cfg, repo, target, leaseID, slug, ghRepo, label, ref, fields, *waitTimeout, owner)
 	if err != nil {
 		return err
 	}
@@ -206,8 +228,11 @@ func (a App) actionsHydrate(ctx context.Context, args []string) error {
 	return nil
 }
 
-func (a App) hydrateActionsWithGitHubRunner(ctx context.Context, cfg Config, repo Repo, target SSHTarget, leaseID, slug string, ghRepo GitHubRepo, label, ref string, fields []string, waitTimeout time.Duration) (actionsHydrationState, error) {
-	if err := a.registerGitHubActionsRunner(ctx, cfg, target, leaseID, slug, ghRepo, "", nil); err != nil {
+func (a App) hydrateActionsWithGitHubRunner(ctx context.Context, cfg Config, repo Repo, target SSHTarget, leaseID, slug string, ghRepo GitHubRepo, label, ref string, fields []string, waitTimeout time.Duration, owner *workspaceOwner) (actionsHydrationState, error) {
+	if err := a.registerGitHubActionsRunnerOwned(ctx, cfg, target, leaseID, slug, ghRepo, "", nil, owner); err != nil {
+		return actionsHydrationState{}, err
+	}
+	if err := invalidateActionsHydrationWorkspaces(ctx, cfg, repo, target, leaseID); err != nil {
 		return actionsHydrationState{}, err
 	}
 	if err := clearActionsHydrationState(ctx, target, leaseID); err != nil {
@@ -231,26 +256,65 @@ func (a App) hydrateActionsWithGitHubRunner(ctx context.Context, cfg Config, rep
 	if !workflowFieldsContain(fields, "crabbox_job") {
 		expectedJob = ""
 	}
+	monitorStarted := false
+	if owner != nil {
+		if err := runSSHQuiet(ctx, target, remotePrepareActionsHydrationMonitorForTarget(target, leaseID, owner)); err != nil {
+			return actionsHydrationState{}, exit(7, "prepare Actions hydration child witness on %s: %v", target.Host, err)
+		}
+		monitor := remoteActionsHydrationMonitorForTarget(target, leaseID, waitTimeout, owner)
+		if _, err := runSSHOutput(contextWithoutWorkspaceOwner(ctx), target, owner.WrapBackgroundCommand(monitor)); err != nil {
+			return actionsHydrationState{}, exit(7, "start Actions hydration child witness on %s: %v", target.Host, err)
+		}
+		monitorStarted = true
+	}
+	cancelMonitor := func() {
+		if !monitorStarted {
+			return
+		}
+		cancelCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 45*time.Second)
+		cancelCtx = contextWithoutWorkspaceOwner(cancelCtx)
+		_ = runSSHQuiet(cancelCtx, target, remoteCancelActionsHydrationMonitorForTarget(target, leaseID, owner))
+		cancel()
+		if waitWorkspaceOwnerNoChild(context.WithoutCancel(ctx), owner, 40*time.Second) == nil {
+			cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+			cleanupCtx = contextWithoutWorkspaceOwner(cleanupCtx)
+			_ = runSSHQuiet(cleanupCtx, target, remotePrepareActionsHydrationMonitorForTarget(target, leaseID, owner))
+			cleanupCancel()
+		}
+	}
 	if err := dispatchGitHubActionsWorkflow(ctx, repo.Root, ghRepo, cfg.Actions.Workflow, ref, fields, target.ChildEnvDenylist); err != nil {
 		if expectedJob != "" && strings.Contains(err.Error(), "Unexpected input") {
 			fields = dropWorkflowField(fields, "crabbox_job")
 			expectedJob = ""
 			fmt.Fprintf(a.Stderr, "warning: retrying workflow dispatch without crabbox_job for compatibility\n")
 			if retryErr := dispatchGitHubActionsWorkflow(ctx, repo.Root, ghRepo, cfg.Actions.Workflow, ref, fields, target.ChildEnvDenylist); retryErr != nil {
+				cancelMonitor()
 				return actionsHydrationState{}, retryErr
 			}
 		} else {
+			cancelMonitor()
 			return actionsHydrationState{}, err
 		}
 	}
 	fmt.Fprintf(a.Stdout, "dispatched workflow=%s repo=%s ref=%s runner_label=%s\n", cfg.Actions.Workflow, ghRepo.Slug(), ref, label)
-	return waitForActionsHydration(ctx, target, leaseID, expectedJob, waitTimeout, a.Stderr)
+	// The monitor is the sole child witness while polling stays read-only. Masking
+	// the owner value avoids replacing it and still preserves owner cancellation.
+	waitCtx := contextWithoutWorkspaceOwner(ctx)
+	state, err := waitForActionsHydration(waitCtx, target, leaseID, expectedJob, waitTimeout, a.Stderr)
+	if err != nil {
+		cancelMonitor()
+		return actionsHydrationState{}, err
+	}
+	if err := waitWorkspaceOwnerNoChild(ctx, owner, 15*time.Second); err != nil {
+		return actionsHydrationState{}, err
+	}
+	return state, nil
 }
 
 func (a App) actionsRegister(ctx context.Context, args []string) error {
 	defaults := defaultConfig()
 	fs := newFlagSet("actions register", a.Stderr)
-	provider := fs.String("provider", defaults.Provider, providerHelpAll())
+	provider := registerProviderSelectionFlag(fs, defaults, providerHelpAll())
 	providerFlags := registerProviderFlags(fs, defaults)
 	targetFlags := registerTargetFlags(fs, defaults)
 	networkFlags := registerNetworkModeFlag(fs, defaults)
@@ -349,6 +413,10 @@ func (a App) actionsDispatch(ctx context.Context, args []string) error {
 }
 
 func (a App) registerGitHubActionsRunner(ctx context.Context, cfg Config, target SSHTarget, leaseID, slug string, ghRepo GitHubRepo, nameOverride string, extraLabels []string) error {
+	return a.registerGitHubActionsRunnerOwned(ctx, cfg, target, leaseID, slug, ghRepo, nameOverride, extraLabels, nil)
+}
+
+func (a App) registerGitHubActionsRunnerOwned(ctx context.Context, cfg Config, target SSHTarget, leaseID, slug string, ghRepo GitHubRepo, nameOverride string, extraLabels []string, owner *workspaceOwner) error {
 	if !supportsGitHubActionsRunnerTarget(target) {
 		return exit(2, "actions runner registration currently supports Linux and Windows targets only")
 	}
@@ -432,35 +500,45 @@ func exitCodeForError(err error, fallback int) int {
 	return fallback
 }
 
-func (a App) hydrateActionsLocally(ctx context.Context, cfg Config, repo Repo, target SSHTarget, leaseID, expectedJob string, fields []string, waitTimeout time.Duration, streamOutput bool, syncBefore bool) (actionsHydrationState, error) {
+type localActionsHydrationPlan struct {
+	leaseID, workdir, jobName, expectedJob, script, warnings string
+}
+
+func prepareLocalActionsHydration(cfg Config, repo Repo, target SSHTarget, leaseID, expectedJob string, fields []string) (localActionsHydrationPlan, error) {
+	target = targetWithConfigDefaults(target, cfg)
 	if !supportsLocalActionsHydrateTarget(target) {
-		return actionsHydrationState{}, exit(2, "local Actions hydration currently supports Linux and Windows WSL2 targets only")
+		return localActionsHydrationPlan{}, exit(2, "local Actions hydration currently supports Linux and Windows WSL2 targets only")
 	}
 	if err := validateWorkflowInputFields(fields); err != nil {
-		return actionsHydrationState{}, err
+		return localActionsHydrationPlan{}, err
 	}
 	workflowPath, err := localActionsWorkflowPath(repo.Root, cfg.Actions.Workflow)
 	if err != nil {
-		return actionsHydrationState{}, err
+		return localActionsHydrationPlan{}, err
 	}
-	workflow, err := readLocalHydrateWorkflow(workflowPath)
+	data, err := os.ReadFile(workflowPath)
 	if err != nil {
-		return actionsHydrationState{}, err
+		return localActionsHydrationPlan{}, err
+	}
+	workflow, err := parseLocalHydrateWorkflow(data, workflowPath)
+	if err != nil {
+		return localActionsHydrationPlan{}, err
 	}
 	jobName, job, err := selectLocalHydrateJob(workflow, cfg.Actions.Job)
 	if err != nil {
-		return actionsHydrationState{}, exit(2, "workflow %s %v", cfg.Actions.Workflow, err)
+		return localActionsHydrationPlan{}, exit(2, "workflow %s %v", cfg.Actions.Workflow, err)
 	}
-	if inputs, defaults, required, ok, err := parseWorkflowDispatchInputSpecFromFile(workflowPath); err != nil {
-		return actionsHydrationState{}, err
+	var warnings strings.Builder
+	if inputs, defaults, required, ok, err := parseWorkflowDispatchInputSpec(data); err != nil {
+		return localActionsHydrationPlan{}, err
 	} else if ok {
 		fields = applyWorkflowInputDefaults(fields, defaults)
 		if missing := missingRequiredWorkflowInputs(fields, required); len(missing) > 0 {
-			return actionsHydrationState{}, exit(2, "workflow %s requires hydrate input(s) %s; pass them with -f key=value or define defaults", cfg.Actions.Workflow, strings.Join(missing, ","))
+			return localActionsHydrationPlan{}, exit(2, "workflow %s requires hydrate input(s) %s; pass them with -f key=value or define defaults", cfg.Actions.Workflow, strings.Join(missing, ","))
 		}
 		filtered, dropped := filterWorkflowInputs(fields, inputs)
 		for _, field := range dropped {
-			fmt.Fprintf(a.Stderr, "warning: workflow %s does not declare input %s; omitting it\n", cfg.Actions.Workflow, fieldName(field))
+			fmt.Fprintf(&warnings, "warning: workflow %s does not declare input %s; omitting it\n", cfg.Actions.Workflow, fieldName(field))
 		}
 		fields = filtered
 		if !workflowFieldsContain(fields, "crabbox_job") {
@@ -468,25 +546,45 @@ func (a App) hydrateActionsLocally(ctx context.Context, cfg Config, repo Repo, t
 		}
 		for _, required := range []string{"crabbox_id", "crabbox_runner_label", "crabbox_keep_alive_minutes"} {
 			if !inputs[required] {
-				return actionsHydrationState{}, exit(2, "workflow %s does not declare required hydrate input %s", cfg.Actions.Workflow, required)
+				return localActionsHydrationPlan{}, exit(2, "workflow %s does not declare required hydrate input %s", cfg.Actions.Workflow, required)
 			}
 		}
 	}
 	workdir := remoteJoin(cfg, leaseID, repo.Name)
-	if streamOutput {
-		fmt.Fprintf(a.Stdout, "local actions hydrate workflow=%s job=%s workspace=%s\n", cfg.Actions.Workflow, jobName, workdir)
+	script, err := localActionsHydrateScript(cfg, repo, workflow, job, jobName, leaseID, fields, workdir)
+	if err != nil {
+		return localActionsHydrationPlan{}, err
 	}
-	if err := clearActionsHydrationState(ctx, target, leaseID); err != nil {
+	return localActionsHydrationPlan{leaseID: leaseID, workdir: workdir, jobName: jobName, expectedJob: expectedJob, script: script, warnings: warnings.String()}, nil
+}
+
+func (a App) hydrateActionsLocally(ctx context.Context, cfg Config, repo Repo, target SSHTarget, leaseID, expectedJob string, fields []string, waitTimeout time.Duration, streamOutput bool, syncBefore bool, owner *workspaceOwner) (actionsHydrationState, error) {
+	plan, err := prepareLocalActionsHydration(cfg, repo, target, leaseID, expectedJob, fields)
+	if err != nil {
+		return actionsHydrationState{}, err
+	}
+	return a.executeLocalActionsHydration(ctx, cfg, repo, target, plan, waitTimeout, streamOutput, syncBefore, owner)
+}
+
+func (a App) executeLocalActionsHydration(ctx context.Context, cfg Config, repo Repo, target SSHTarget, plan localActionsHydrationPlan, waitTimeout time.Duration, streamOutput bool, syncBefore bool, owner *workspaceOwner) (actionsHydrationState, error) {
+	target = targetWithConfigDefaults(target, cfg)
+	fmt.Fprint(a.Stderr, plan.warnings)
+	if streamOutput {
+		fmt.Fprintf(a.Stdout, "local actions hydrate workflow=%s job=%s workspace=%s\n", cfg.Actions.Workflow, plan.jobName, plan.workdir)
+	}
+	if err := invalidateActionsHydrationWorkspaces(ctx, cfg, repo, target, plan.leaseID); err != nil {
+		return actionsHydrationState{}, err
+	}
+	if err := clearActionsHydrationState(ctx, target, plan.leaseID); err != nil {
 		return actionsHydrationState{}, err
 	}
 	if syncBefore {
-		if err := a.syncLocalActionsWorkspace(ctx, cfg, repo, target, workdir); err != nil {
+		if err := a.syncLocalActionsWorkspace(ctx, cfg, repo, target, plan.workdir); err != nil {
 			return actionsHydrationState{}, err
 		}
 	}
-	script, err := localActionsHydrateScript(cfg, repo, workflow, job, jobName, leaseID, fields, workdir)
-	if err != nil {
-		return actionsHydrationState{}, err
+	if _, err := runIdempotentSSHCombinedOutput(ctx, target, remoteInvalidateSyncFingerprintForTarget(target, plan.workdir), idempotentSSHRetryDelay); err != nil {
+		return actionsHydrationState{}, exit(7, "invalidate reusable sync fingerprint before Actions hydration: %v", err)
 	}
 	stdout := io.Discard
 	stderr := io.Discard
@@ -494,33 +592,74 @@ func (a App) hydrateActionsLocally(ctx context.Context, cfg Config, repo Repo, t
 		stdout = a.Stdout
 		stderr = a.Stderr
 	}
-	if err := runSSHInput(ctx, target, remoteInstallLocalActionsHydrateScript(leaseID), strings.NewReader(script), stdout, stderr); err != nil {
+	if err := runSSHInput(ctx, target, remoteInstallLocalActionsHydrateScript(plan.leaseID), strings.NewReader(plan.script), stdout, stderr); err != nil {
 		return actionsHydrationState{}, exit(7, "install local Actions hydration script on %s: %v", target.Host, err)
 	}
 	if isWindowsWSL2Target(target) {
-		if err := runSSHInput(ctx, target, remoteRunLocalActionsHydrateScriptForeground(leaseID, waitTimeout), nil, stdout, stderr); err != nil {
+		remote := remoteRunLocalActionsHydrateScriptForeground(plan.leaseID, waitTimeout)
+		if err := runSSHInput(ctx, target, remote, nil, stdout, stderr); err != nil {
 			return actionsHydrationState{}, exit(7, "run local Actions hydration on %s: %v", target.Host, err)
 		}
-		state, err := readActionsHydrationState(ctx, target, leaseID)
+		stateCtx := ctx
+		if owner != nil {
+			stateCtx = contextWithoutWorkspaceOwner(ctx)
+		}
+		state, err := readActionsHydrationState(stateCtx, target, plan.leaseID)
 		if err != nil || state.Workspace == "" {
 			if err != nil {
-				return actionsHydrationState{}, exit(7, "read local Actions hydration marker for %s: %v", leaseID, err)
+				return actionsHydrationState{}, exit(7, "read local Actions hydration marker for %s: %v", plan.leaseID, err)
 			}
-			return actionsHydrationState{}, exit(7, "local Actions hydration completed without marker for %s", leaseID)
+			return actionsHydrationState{}, exit(7, "local Actions hydration completed without marker for %s", plan.leaseID)
 		}
-		if expectedJob != "" && state.Job != "" && state.Job != expectedJob {
-			return actionsHydrationState{}, exit(5, "local Actions hydration marker for %s came from job %q, expected %q", leaseID, state.Job, expectedJob)
+		if plan.expectedJob != "" && state.Job != "" && state.Job != plan.expectedJob {
+			return actionsHydrationState{}, exit(5, "local Actions hydration marker for %s came from job %q, expected %q", plan.leaseID, state.Job, plan.expectedJob)
 		}
-		if err := ensureLocalActionsRunEnv(ctx, target, leaseID, state); err != nil {
+		if err := ensureLocalActionsRunEnv(ctx, target, plan.leaseID, state); err != nil {
 			return actionsHydrationState{}, err
 		}
 		return state, nil
 	}
-	pid, err := runSSHOutput(ctx, target, remoteStartLocalActionsHydrateScript(leaseID))
+	startRemote := remoteStartLocalActionsHydrateScript(plan.leaseID)
+	if owner != nil {
+		startRemote = owner.WrapBackgroundCommand(remoteLocalActionsHydrateBackgroundPayload(plan.leaseID))
+	}
+	startCtx := ctx
+	if owner != nil {
+		startCtx = contextWithoutWorkspaceOwner(ctx)
+	}
+	pid, err := runSSHOutput(startCtx, target, startRemote)
 	if err != nil {
 		return actionsHydrationState{}, exit(7, "start local Actions hydration on %s: %v", target.Host, err)
 	}
-	return waitForLocalActionsHydration(ctx, target, leaseID, expectedJob, strings.TrimSpace(pid), waitTimeout, stderr)
+	waitCtx := ctx
+	if owner != nil {
+		waitCtx = contextWithoutWorkspaceOwner(ctx)
+	}
+	state, err := waitForLocalActionsHydration(waitCtx, target, plan.leaseID, plan.expectedJob, strings.TrimSpace(pid), waitTimeout, stderr)
+	if err != nil {
+		return actionsHydrationState{}, err
+	}
+	if err := waitWorkspaceOwnerNoChild(ctx, owner, 15*time.Second); err != nil {
+		return actionsHydrationState{}, err
+	}
+	return state, nil
+}
+
+func invalidateActionsHydrationWorkspaces(ctx context.Context, cfg Config, repo Repo, target SSHTarget, leaseID string) error {
+	workdirs := []string{remoteJoin(cfg, leaseID, repo.Name)}
+	state, err := readActionsHydrationState(ctx, target, leaseID)
+	if err != nil {
+		return exit(7, "read Actions workspace before fingerprint invalidation: %v", err)
+	}
+	if strings.TrimSpace(state.Workspace) != "" {
+		workdirs = appendUniqueStrings(workdirs, state.Workspace)
+	}
+	for _, workdir := range workdirs {
+		if _, err := runIdempotentSSHCombinedOutput(ctx, target, remoteInvalidateSyncFingerprintForTarget(target, workdir), idempotentSSHRetryDelay); err != nil {
+			return exit(7, "invalidate reusable sync fingerprint before Actions hydration: %v", err)
+		}
+	}
+	return nil
 }
 
 func (a App) syncLocalActionsWorkspace(ctx context.Context, cfg Config, repo Repo, target SSHTarget, workdir string) error {
@@ -531,46 +670,50 @@ func (a App) syncLocalActionsWorkspace(ctx context.Context, cfg Config, repo Rep
 	if err != nil {
 		return err
 	}
-	manifest, err := syncManifestFiltered(repo.Root, excludes, syncIncludes(cfg))
+	manifest, err := syncManifestFilteredRules(repo.Root, excludes, syncIncludes(cfg))
 	if err != nil {
 		return exit(6, "build sync file list: %v", err)
 	}
 	if err := checkSyncPreflight(manifest, cfg, false, a.Stderr); err != nil {
 		return err
 	}
-	if err := runSSHQuiet(ctx, target, remoteMkdir(workdir)); err != nil {
+	if _, err := runIdempotentSSHCombinedOutput(ctx, target, remoteMkdir(workdir), idempotentSSHRetryDelay); err != nil {
 		return exit(7, "create remote workdir: %v", err)
 	}
-	gitSeed, credentialBlocked := syncGitSeedDecision(cfg, repo)
+	coherence, credentialBlocked := syncGitCoherencePlan(cfg, repo)
 	if credentialBlocked {
 		warnCredentialBearingGitSeed(a.Stderr)
 	}
-	if gitSeed {
-		if err := runSSHQuiet(ctx, target, remoteGitSeed(workdir, repo.RemoteURL, repo.Head)); err != nil {
+	if coherence.seedEnabled() {
+		if _, err := runIdempotentSSHCombinedOutput(ctx, target, remoteGitSeed(workdir, coherence), idempotentSSHRetryDelay); err != nil {
 			fmt.Fprintf(a.Stderr, "warning: remote git seed failed: %v\n", err)
 		}
 	}
 	manifestData := manifest.NUL()
 	deletedData := manifest.DeletedNUL()
+	finalizeToken, err := randomHex(16)
+	if err != nil {
+		return exit(6, "create sync finalize token: %v", err)
+	}
 	manifestInput := syncManifestInputForTarget(target, manifestData, deletedData)
-	if err := runSSHInput(ctx, target, remoteWriteSyncManifestsNewForTarget(target, workdir), strings.NewReader(manifestInput), io.Discard, a.Stderr); err != nil {
+	if err := runSSHInput(ctx, target, remoteWriteSyncManifestsNewForTarget(target, workdir, finalizeToken), strings.NewReader(manifestInput), io.Discard, a.Stderr); err != nil {
 		return exit(7, "write sync manifests: %v", err)
 	}
 	if shouldPruneRemoteSync(cfg.Sync.Delete, false) {
-		if err := runSSHQuiet(ctx, target, remoteSeedSyncManifestFromGit(workdir)); err != nil {
+		if _, err := runIdempotentSSHCombinedOutput(ctx, target, remoteSeedSyncManifestFromGit(workdir), idempotentSSHRetryDelay); err != nil {
 			return exit(6, "remote sync seed manifest failed: %v", err)
 		}
-		if err := runSSHQuiet(ctx, target, remotePruneSyncManifestForTarget(target, workdir)); err != nil {
+		if _, err := runIdempotentSSHCombinedOutput(ctx, target, remotePruneSyncManifestForTarget(target, workdir, finalizeToken), idempotentSSHRetryDelay); err != nil {
 			return exit(6, "remote sync prune failed: %v", err)
 		}
 	}
 	fmt.Fprintf(a.Stderr, "syncing %s -> %s:%s for local actions hydrate\n", repo.Root, target.Host, workdir)
-	if err := rsync(ctx, target, repo.Root, workdir, excludes, a.Stdout, a.Stderr, rsyncOptions{Checksum: cfg.Sync.Checksum, UseFilesFrom: true, FilesFrom: manifestData, NoTimes: localContainerDockerSocketConfig(cfg), Timeout: cfg.Sync.Timeout, HeartbeatInterval: 15 * time.Second}); err != nil {
+	if err := rsync(ctx, target, repo.Root, workdir, excludes.patterns(), a.Stdout, a.Stderr, rsyncOptions{Checksum: cfg.Sync.Checksum, UseFilesFrom: true, FilesFrom: manifestData, NoTimes: localContainerDockerSocketConfig(cfg), Timeout: cfg.Sync.Timeout, HeartbeatInterval: 15 * time.Second}); err != nil {
 		return exit(6, "rsync failed: %v", err)
 	}
 	fingerprint := ""
 	if cfg.Sync.Fingerprint {
-		if value, err := syncFingerprintForManifest(repo, cfg, manifest, excludes); err == nil {
+		if value, err := syncFingerprintForManifest(repo, cfg, manifest, excludes, coherence); err == nil {
 			fingerprint = value
 		} else {
 			fmt.Fprintf(a.Stderr, "warning: sync fingerprint failed: %v\n", err)
@@ -582,22 +725,16 @@ func (a App) syncLocalActionsWorkspace(ctx context.Context, cfg Config, repo Rep
 		BaseRef:            cfg.Sync.BaseRef,
 		BaseSHA:            gitHydrateBaseSHA(repo, cfg.Sync.BaseRef),
 		Fingerprint:        fingerprint,
+		Token:              finalizeToken,
+		Coherence:          coherence,
 	})
-	if out, err := runSSHCombinedOutput(ctx, target, finalizeCommand); err != nil {
+	if out, err := runIdempotentSSHCombinedOutput(ctx, target, finalizeCommand, idempotentSSHRetryDelay); err != nil {
 		if out != "" {
 			return exit(6, "remote sync finalize failed: %s: %v", out, err)
 		}
 		return exit(6, "remote sync finalize failed: %v", err)
 	}
 	return nil
-}
-
-func parseWorkflowDispatchInputSpecFromFile(path string) (map[string]bool, map[string]string, map[string]bool, bool, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, nil, nil, false, err
-	}
-	return parseWorkflowDispatchInputSpec(data)
 }
 
 func localActionsWorkflowPath(root, workflow string) (string, error) {
@@ -699,12 +836,8 @@ type localCompositeRuns struct {
 	Steps []localHydrateStep `yaml:"steps"`
 }
 
-func readLocalHydrateWorkflow(path string) (localHydrateWorkflow, error) {
+func parseLocalHydrateWorkflow(data []byte, path string) (localHydrateWorkflow, error) {
 	var workflow localHydrateWorkflow
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return workflow, err
-	}
 	if err := yaml.Unmarshal(data, &workflow); err != nil {
 		return workflow, err
 	}
@@ -2269,10 +2402,35 @@ func runActionsHydrationQuiet(ctx context.Context, target SSHTarget, remote stri
 }
 
 func clearActionsHydrationState(ctx context.Context, target SSHTarget, leaseID string) error {
-	if err := runSSHQuiet(ctx, target, remoteClearActionsHydrationStateForTarget(target, leaseID)); err != nil {
-		return exit(7, "clear GitHub Actions hydration marker on %s: %v", target.Host, err)
+	remote := remoteClearActionsHydrationStateForTarget(target, leaseID)
+	lastOutput, lastErr := runIdempotentSSHCombinedOutput(ctx, target, remote, idempotentSSHRetryDelay)
+	if lastErr == nil {
+		return nil
 	}
-	return nil
+	details := strings.TrimSpace(lastOutput)
+	if target.AuthSecret {
+		details = RedactDiagnosticSecrets(details, target.User)
+	}
+	if details != "" {
+		return exit(7, "clear GitHub Actions hydration marker on %s: %v: %s", target.Host, lastErr, details)
+	}
+	return exit(7, "clear GitHub Actions hydration marker on %s: %v", target.Host, lastErr)
+}
+
+func invalidateActionsHydrationMarker(ctx context.Context, target SSHTarget, leaseID string) error {
+	remote := remoteInvalidateActionsHydrationMarkerForTarget(target, leaseID)
+	lastOutput, lastErr := runIdempotentSSHCombinedOutput(ctx, target, remote, idempotentSSHRetryDelay)
+	if lastErr == nil {
+		return nil
+	}
+	details := strings.TrimSpace(lastOutput)
+	if target.AuthSecret {
+		details = RedactDiagnosticSecrets(details, target.User)
+	}
+	if details != "" {
+		return exit(7, "invalidate GitHub Actions hydration marker on %s: %v: %s", target.Host, lastErr, details)
+	}
+	return exit(7, "invalidate GitHub Actions hydration marker on %s: %v", target.Host, lastErr)
 }
 
 func writeActionsHydrationStop(ctx context.Context, target SSHTarget, leaseID string) error {
@@ -2344,17 +2502,174 @@ exit 0
 	return remoteReadActionsHydrationState(leaseID)
 }
 
+func remoteInvalidateActionsHydrationMarker(leaseID string) string {
+	return "rm -f \"$HOME\"/" + shellQuote(actionsHydrationStatePath(leaseID))
+}
+
+func remoteInvalidateActionsHydrationMarkerForTarget(target SSHTarget, leaseID string) string {
+	if isWindowsNativeTarget(target) {
+		return powershellCommand(`$ErrorActionPreference = "Stop"
+$path = ` + psQuote(windowsActionsHydrationPath(actionsHydrationStatePath(leaseID))) + `
+if (Test-Path -LiteralPath $path) {
+  Remove-Item -LiteralPath $path -Force -ErrorAction Stop
+}
+exit 0
+`)
+	}
+	return remoteInvalidateActionsHydrationMarker(leaseID)
+}
+
 func remoteInstallLocalActionsHydrateScript(leaseID string) string {
 	path := "\"$HOME\"/" + shellQuote(actionsHydrationLocalScriptPath(leaseID))
 	return "mkdir -p \"$HOME\"/" + shellQuote(actionsHydrationDir()) + " && cat > " + path + " && chmod 700 " + path
 }
 
 func remoteStartLocalActionsHydrateScript(leaseID string) string {
+	payload := remoteLocalActionsHydrateBackgroundPayload(leaseID)
+	return "nohup sh -c " + shellQuote(payload) + " >/dev/null 2>&1 < /dev/null & printf '%s\\n' \"$!\""
+}
+
+func remoteLocalActionsHydrateBackgroundPayload(leaseID string) string {
 	script := "\"$HOME\"/" + shellQuote(actionsHydrationLocalScriptPath(leaseID))
 	logPath := "\"$HOME\"/" + shellQuote(actionsHydrationLocalLogPath(leaseID))
 	exitPath := "\"$HOME\"/" + shellQuote(actionsHydrationLocalExitPath(leaseID))
-	wrapper := `bash "$1" >"$2" 2>&1; printf '%s\n' "$?" >"$3"`
-	return "rm -f " + exitPath + " " + logPath + " && nohup bash -c " + shellQuote(wrapper) + " sh " + script + " " + logPath + " " + exitPath + " >/dev/null 2>&1 < /dev/null & printf '%s\\n' \"$!\""
+	wrapper := `rm -f "$3" "$2"; bash "$1" >"$2" 2>&1; code=$?; printf '%s\n' "$code" >"$3"; exit "$code"`
+	return "bash -c " + shellQuote(wrapper) + " sh " + script + " " + logPath + " " + exitPath
+}
+
+func remoteActionsHydrationMonitorForTarget(target SSHTarget, leaseID string, timeout time.Duration, owners ...*workspaceOwner) string {
+	if timeout <= 0 {
+		timeout = 20 * time.Minute
+	}
+	seconds := int((timeout + time.Second - 1) / time.Second)
+	var owner *workspaceOwner
+	if len(owners) > 0 {
+		owner = owners[0]
+	}
+	if isWindowsNativeTarget(target) {
+		path := windowsActionsHydrationPath(actionsHydrationStatePath(leaseID))
+		stop := windowsActionsHydrationPath(actionsHydrationOwnerMonitorStopPath(leaseID, ownerToken(owner)))
+		if owner != nil {
+			return powershellCommand(`$marker = ` + psQuote(path) + `
+$stop = ` + psQuote(stop) + `
+$ownerState = Join-Path $HOME ` + psQuote(`.crabbox\workspace-owners\`+owner.key+`.owner`) + `
+$ownerToken = ` + psQuote(owner.token) + `
+function Stop-CrabboxRunner {
+  Get-Process -Name "Runner.Worker","Runner.Listener" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+  $deadline = [DateTime]::UtcNow.AddSeconds(30)
+  while ([DateTime]::UtcNow -lt $deadline) {
+    if ($null -eq (Get-Process -Name "Runner.Worker","Runner.Listener" -ErrorAction SilentlyContinue)) { return $true }
+    Start-Sleep -Milliseconds 250
+  }
+  return $false
+}
+while ($true) {
+  if (Test-Path -LiteralPath $marker -PathType Leaf) { exit 0 }
+  $mustStop = Test-Path -LiteralPath $stop -PathType Leaf
+  if (-not $mustStop) {
+    try {
+      $state = @(Get-Content -LiteralPath $ownerState -ErrorAction Stop)
+      $mustStop = $state.Count -ne 3 -or $state[0] -ne "v1" -or $state[1] -ne $ownerToken -or $state[2] -notmatch "^[0-9]+$" -or [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() -ge [Int64]$state[2]
+    } catch { $mustStop = $true }
+  }
+  if ($mustStop -and (Stop-CrabboxRunner)) { exit 125 }
+  Start-Sleep -Seconds 1
+}
+`)
+		}
+		return powershellCommand(`$deadline = [DateTime]::UtcNow.AddSeconds(` + strconv.Itoa(seconds) + `)
+while ([DateTime]::UtcNow -lt $deadline) {
+  if (Test-Path -LiteralPath ` + psQuote(path) + ` -PathType Leaf) { exit 0 }
+  if (Test-Path -LiteralPath ` + psQuote(stop) + ` -PathType Leaf) { exit 125 }
+  Start-Sleep -Seconds 1
+}
+exit 124
+`)
+	}
+	path := "\"$HOME\"/" + shellQuote(actionsHydrationStatePath(leaseID))
+	stop := "\"$HOME\"/" + shellQuote(actionsHydrationOwnerMonitorStopPath(leaseID, ownerToken(owner)))
+	if owner != nil {
+		return `marker=` + path + `
+stop=` + stop + `
+owner_state="$HOME/.crabbox/workspace-owners/` + owner.key + `.owner"
+owner_token=` + shellQuote(owner.token) + `
+stop_runner() {
+	if command -v systemctl >/dev/null 2>&1; then
+		if [ "$(id -u)" = 0 ]; then systemctl stop crabbox-actions-runner.service >/dev/null 2>&1 || true
+		elif command -v sudo >/dev/null 2>&1; then sudo -n systemctl stop crabbox-actions-runner.service >/dev/null 2>&1 || true
+		fi
+	fi
+	pkill -TERM -f '[R]unner.Worker|[R]unner.Listener' >/dev/null 2>&1 || true
+	deadline=$(($(date +%s) + 30))
+	while ps -ax -o command= 2>/dev/null | grep -E '[R]unner.Worker|[R]unner.Listener' >/dev/null 2>&1; do
+		[ "$(date +%s)" -lt "$deadline" ] || return 1
+		sleep 0.25
+	done
+}
+while :; do
+	[ ! -f "$marker" ] || exit 0
+	must_stop=
+	[ ! -f "$stop" ] || must_stop=1
+	state_version=$(sed -n '1p' "$owner_state" 2>/dev/null || true)
+	state_token=$(sed -n '2p' "$owner_state" 2>/dev/null || true)
+	state_expiry=$(sed -n '3p' "$owner_state" 2>/dev/null || true)
+	case "$state_expiry" in ''|*[!0-9]*) must_stop=1; state_expiry=0 ;; esac
+	if [ "$state_version" != v1 ] || [ "$state_token" != "$owner_token" ] || [ "$(date +%s)" -ge "$state_expiry" ]; then must_stop=1; fi
+	if [ -n "$must_stop" ] && stop_runner; then exit 125; fi
+	sleep 1
+done`
+	}
+	return "deadline=$(($(date +%s) + " + strconv.Itoa(seconds) + ")); while [ \"$(date +%s)\" -lt \"$deadline\" ]; do [ -f " + path + " ] && exit 0; [ -f " + stop + " ] && exit 125; sleep 1; done; exit 124"
+}
+
+func remotePrepareActionsHydrationMonitorForTarget(target SSHTarget, leaseID string, owner *workspaceOwner) string {
+	path := actionsHydrationOwnerMonitorStopPath(leaseID, ownerToken(owner))
+	if isWindowsNativeTarget(target) {
+		return powershellCommand(`Remove-Item -LiteralPath ` + psQuote(windowsActionsHydrationPath(path)) + ` -Force -ErrorAction SilentlyContinue
+exit 0
+`)
+	}
+	return "rm -f \"$HOME\"/" + shellQuote(path)
+}
+
+func remoteCancelActionsHydrationMonitorForTarget(target SSHTarget, leaseID string, owner *workspaceOwner) string {
+	path := actionsHydrationOwnerMonitorStopPath(leaseID, ownerToken(owner))
+	if isWindowsNativeTarget(target) {
+		return powershellCommand(`$path = ` + psQuote(windowsActionsHydrationPath(path)) + `
+New-Item -ItemType Directory -Force -Path ([IO.Path]::GetDirectoryName($path)) | Out-Null
+New-Item -ItemType File -Force -Path $path | Out-Null
+exit 0
+`)
+	}
+	return "mkdir -p \"$HOME\"/" + shellQuote(actionsHydrationDir()) + " && touch \"$HOME\"/" + shellQuote(path)
+}
+
+func waitWorkspaceOwnerNoChild(ctx context.Context, owner *workspaceOwner, timeout time.Duration) error {
+	if owner == nil {
+		return nil
+	}
+	if timeout <= 0 {
+		timeout = 15 * time.Second
+	}
+	deadline := time.Now().Add(timeout)
+	for {
+		checkCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		err := owner.ConfirmNoChild(checkCtx)
+		cancel()
+		if err == nil {
+			return nil
+		}
+		if !strings.Contains(err.Error(), "child") || time.Now().After(deadline) {
+			return err
+		}
+		timer := time.NewTimer(250 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
 }
 
 func remoteRunLocalActionsHydrateScriptForeground(leaseID string, timeout time.Duration) string {
@@ -2459,6 +2774,17 @@ func actionsHydrationServicesPath(leaseID string) string {
 
 func actionsHydrationStopPath(leaseID string) string {
 	return actionsHydrationDir() + "/" + leaseID + ".stop"
+}
+
+func ownerToken(owner *workspaceOwner) string {
+	if owner == nil || owner.token == "" {
+		return "unowned"
+	}
+	return owner.token
+}
+
+func actionsHydrationOwnerMonitorStopPath(leaseID, token string) string {
+	return actionsHydrationDir() + "/" + leaseID + ".owner-monitor-stop." + token
 }
 
 func actionsHydrationLocalScriptPath(leaseID string) string {

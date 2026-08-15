@@ -106,6 +106,18 @@ type CoordinatorLease struct {
 	ProviderMetadata      map[string]any                 `json:"providerMetadata,omitempty"`
 }
 
+type CoordinatorCanceledCreateAttestation struct {
+	Version          int    `json:"version"`
+	RequestedLeaseID string `json:"requestedLeaseID"`
+	CreateAttemptID  string `json:"createAttemptID"`
+	State            string `json:"state"`
+}
+
+type CoordinatorCanceledCreateResult struct {
+	CanceledCreate CoordinatorCanceledCreateAttestation `json:"canceledCreate"`
+	Lease          *CoordinatorLease                    `json:"lease,omitempty"`
+}
+
 type CoordinatorLeaseImage struct {
 	ID         string `json:"id"`
 	Source     string `json:"source"`
@@ -860,6 +872,18 @@ func newCoordinatorClient(cfg Config) (*CoordinatorClient, bool, error) {
 }
 
 func (c *CoordinatorClient) CreateLease(ctx context.Context, cfg Config, publicKey string, keep bool, leaseID, slug string) (CoordinatorLease, error) {
+	return c.CreateLeaseWithAttempt(ctx, cfg, publicKey, keep, leaseID, slug, newCreateAttemptID())
+}
+
+func (c *CoordinatorClient) CreateLeaseWithAttempt(ctx context.Context, cfg Config, publicKey string, keep bool, leaseID, slug, createAttemptID string) (CoordinatorLease, error) {
+	return c.createLease(ctx, cfg, publicKey, keep, leaseID, slug, createAttemptID, false)
+}
+
+func (c *CoordinatorClient) EnsureLease(ctx context.Context, cfg Config, publicKey string, keep bool, leaseID, slug string) (CoordinatorLease, error) {
+	return c.createLease(ctx, cfg, publicKey, keep, leaseID, slug, "", true)
+}
+
+func (c *CoordinatorClient) createLease(ctx context.Context, cfg Config, publicKey string, keep bool, leaseID, slug, createAttemptID string, fixed bool) (CoordinatorLease, error) {
 	var res struct {
 		Lease CoordinatorLease `json:"lease"`
 	}
@@ -937,6 +961,9 @@ func (c *CoordinatorClient) CreateLease(ctx context.Context, cfg Config, publicK
 		"pond":                            cfg.Pond,
 		"exposedPorts":                    cfg.ExposedPorts,
 	}
+	if !fixed {
+		req["createAttemptID"] = createAttemptID
+	}
 	if cfg.Provider != "daytona" || cfg.architectureExplicit {
 		req["architecture"] = effectiveArchitectureForConfig(cfg)
 	}
@@ -956,12 +983,16 @@ func (c *CoordinatorClient) CreateLease(ctx context.Context, cfg Config, publicK
 		req["azureOSDisk"] = cfg.AzureOSDisk
 	}
 	addCoordinatorGCPFields(req, cfg)
+	method := http.MethodPost
 	path := "/v1/leases"
-	if !imageRequirementsEmpty(cfg.imageRequirements) {
+	if fixed {
+		method = http.MethodPut
+		path = "/v1/leases/" + url.PathEscape(leaseID)
+	} else if !imageRequirementsEmpty(cfg.imageRequirements) {
 		// Older coordinators do not have this route, so mixed-version use fails closed.
 		path = "/v1/leases/capability-aware"
 	}
-	err = c.do(ctx, http.MethodPost, path, req, &res)
+	err = c.do(ctx, method, path, req, &res)
 	return res.Lease, err
 }
 
@@ -1026,10 +1057,22 @@ func stringSlicesEqual(a, b []string) bool {
 }
 
 func (c *CoordinatorClient) UpdateLeaseTailscale(ctx context.Context, id string, meta TailscaleMetadata) (CoordinatorLease, error) {
+	return c.UpdateLeaseTailscaleForProvider(ctx, id, "", meta)
+}
+
+func (c *CoordinatorClient) UpdateLeaseTailscaleForProvider(ctx context.Context, id, expectedProvider string, meta TailscaleMetadata) (CoordinatorLease, error) {
 	var res struct {
 		Lease CoordinatorLease `json:"lease"`
 	}
-	err := c.do(ctx, http.MethodPost, "/v1/leases/"+url.PathEscape(id)+"/tailscale", meta, &res)
+	expectedProvider, err := canonicalCoordinatorMutationProvider(expectedProvider)
+	if err != nil {
+		return res.Lease, err
+	}
+	body := struct {
+		TailscaleMetadata
+		ExpectedProvider string `json:"expectedProvider,omitempty"`
+	}{TailscaleMetadata: meta, ExpectedProvider: expectedProvider}
+	err = c.do(ctx, http.MethodPost, "/v1/leases/"+url.PathEscape(id)+"/tailscale", body, &res)
 	return res.Lease, err
 }
 
@@ -1085,68 +1128,133 @@ func (c *CoordinatorClient) DeleteLeaseShare(ctx context.Context, id, user strin
 }
 
 func (c *CoordinatorClient) ReleaseLease(ctx context.Context, id string, deleteServer bool) (CoordinatorLease, error) {
+	return c.ReleaseLeaseForProvider(ctx, id, deleteServer, "")
+}
+
+func (c *CoordinatorClient) ReleaseLeaseForProvider(ctx context.Context, id string, deleteServer bool, expectedProvider string) (CoordinatorLease, error) {
 	var res struct {
 		Lease CoordinatorLease `json:"lease"`
 	}
-	err := c.do(ctx, http.MethodPost, "/v1/leases/"+url.PathEscape(id)+"/release", map[string]any{"delete": deleteServer}, &res)
+	expectedProvider, err := canonicalCoordinatorMutationProvider(expectedProvider)
+	if err != nil {
+		return res.Lease, err
+	}
+	body := map[string]any{"delete": deleteServer}
+	if expectedProvider != "" {
+		body["expectedProvider"] = expectedProvider
+	}
+	err = c.do(ctx, http.MethodPost, "/v1/leases/"+url.PathEscape(id)+"/release", body, &res)
 	return res.Lease, err
 }
 
+func (c *CoordinatorClient) CancelLeaseCreate(ctx context.Context, id, createAttemptID string) (CoordinatorCanceledCreateResult, error) {
+	var result CoordinatorCanceledCreateResult
+	err := c.do(ctx, http.MethodPost, "/v1/leases/"+url.PathEscape(id)+"/cancel-create", map[string]any{"createAttemptID": createAttemptID}, &result)
+	return result, err
+}
+
 func (c *CoordinatorClient) CompleteRuntimeAdapterDelete(ctx context.Context, id, adapterID, workspaceID, registrationID string) (CoordinatorLease, error) {
+	return c.CompleteRuntimeAdapterDeleteForProvider(ctx, id, "", adapterID, workspaceID, registrationID)
+}
+
+func (c *CoordinatorClient) CompleteRuntimeAdapterDeleteForProvider(ctx context.Context, id, expectedProvider, adapterID, workspaceID, registrationID string) (CoordinatorLease, error) {
 	var res struct {
 		Lease CoordinatorLease `json:"lease"`
 	}
-	err := c.do(ctx, http.MethodPost, "/v1/leases/"+url.PathEscape(id)+"/release", map[string]any{
+	expectedProvider, err := canonicalCoordinatorMutationProvider(expectedProvider)
+	if err != nil {
+		return res.Lease, err
+	}
+	body := map[string]any{
 		"runtimeAdapterDeleteCompletion": map[string]string{
 			"adapterID":      adapterID,
 			"workspaceID":    workspaceID,
 			"registrationID": registrationID,
 			"status":         "absent",
 		},
-	}, &res)
+	}
+	if expectedProvider != "" {
+		body["expectedProvider"] = expectedProvider
+	}
+	err = c.do(ctx, http.MethodPost, "/v1/leases/"+url.PathEscape(id)+"/release", body, &res)
 	return res.Lease, err
 }
 
 func (c *CoordinatorClient) CompleteLegacyRuntimeAdapterDelete(ctx context.Context, id, adapterID, workspaceID string) (CoordinatorLease, error) {
+	return c.CompleteLegacyRuntimeAdapterDeleteForProvider(ctx, id, "", adapterID, workspaceID)
+}
+
+func (c *CoordinatorClient) CompleteLegacyRuntimeAdapterDeleteForProvider(ctx context.Context, id, expectedProvider, adapterID, workspaceID string) (CoordinatorLease, error) {
 	var res struct {
 		Lease CoordinatorLease `json:"lease"`
 	}
-	err := c.do(ctx, http.MethodPost, "/v1/leases/"+url.PathEscape(id)+"/release", map[string]any{
+	expectedProvider, err := canonicalCoordinatorMutationProvider(expectedProvider)
+	if err != nil {
+		return res.Lease, err
+	}
+	body := map[string]any{
 		"runtimeAdapterLegacyDeleteCompletion": map[string]string{
 			"adapterID":   adapterID,
 			"workspaceID": workspaceID,
 			"status":      "absent",
 		},
-	}, &res)
+	}
+	if expectedProvider != "" {
+		body["expectedProvider"] = expectedProvider
+	}
+	err = c.do(ctx, http.MethodPost, "/v1/leases/"+url.PathEscape(id)+"/release", body, &res)
 	return res.Lease, err
 }
 
 func (c *CoordinatorClient) TouchLease(ctx context.Context, id string) (CoordinatorLease, error) {
-	return c.heartbeatLease(ctx, id, nil, nil)
+	return c.heartbeatLease(ctx, id, "", nil, nil)
+}
+
+func (c *CoordinatorClient) TouchLeaseForProvider(ctx context.Context, id, expectedProvider string) (CoordinatorLease, error) {
+	return c.heartbeatLease(ctx, id, expectedProvider, nil, nil)
 }
 
 func (c *CoordinatorClient) TouchLeaseWithTelemetry(ctx context.Context, id string, telemetry *LeaseTelemetry) (CoordinatorLease, error) {
-	return c.heartbeatLease(ctx, id, nil, telemetry)
+	return c.heartbeatLease(ctx, id, "", nil, telemetry)
+}
+
+func (c *CoordinatorClient) TouchLeaseWithTelemetryForProvider(ctx context.Context, id, expectedProvider string, telemetry *LeaseTelemetry) (CoordinatorLease, error) {
+	return c.heartbeatLease(ctx, id, expectedProvider, nil, telemetry)
 }
 
 func (c *CoordinatorClient) UpdateLeaseIdleTimeout(ctx context.Context, id string, idleTimeout time.Duration) (CoordinatorLease, error) {
-	return c.heartbeatLease(ctx, id, &idleTimeout, nil)
+	return c.heartbeatLease(ctx, id, "", &idleTimeout, nil)
+}
+
+func (c *CoordinatorClient) UpdateLeaseIdleTimeoutForProvider(ctx context.Context, id, expectedProvider string, idleTimeout time.Duration) (CoordinatorLease, error) {
+	return c.heartbeatLease(ctx, id, expectedProvider, &idleTimeout, nil)
 }
 
 func (c *CoordinatorClient) UpdateLeaseIdleTimeoutWithTelemetry(ctx context.Context, id string, idleTimeout time.Duration, telemetry *LeaseTelemetry) (CoordinatorLease, error) {
-	return c.heartbeatLease(ctx, id, &idleTimeout, telemetry)
+	return c.heartbeatLease(ctx, id, "", &idleTimeout, telemetry)
 }
 
-func (c *CoordinatorClient) heartbeatLease(ctx context.Context, id string, idleTimeout *time.Duration, telemetry *LeaseTelemetry) (CoordinatorLease, error) {
+func (c *CoordinatorClient) UpdateLeaseIdleTimeoutWithTelemetryForProvider(ctx context.Context, id, expectedProvider string, idleTimeout time.Duration, telemetry *LeaseTelemetry) (CoordinatorLease, error) {
+	return c.heartbeatLease(ctx, id, expectedProvider, &idleTimeout, telemetry)
+}
+
+func (c *CoordinatorClient) heartbeatLease(ctx context.Context, id, expectedProvider string, idleTimeout *time.Duration, telemetry *LeaseTelemetry) (CoordinatorLease, error) {
 	var res struct {
 		Lease CoordinatorLease `json:"lease"`
 	}
-	err := c.do(ctx, http.MethodPost, "/v1/leases/"+url.PathEscape(id)+"/heartbeat", heartbeatRequestBody(idleTimeout, telemetry), &res)
+	expectedProvider, err := canonicalCoordinatorMutationProvider(expectedProvider)
+	if err != nil {
+		return res.Lease, err
+	}
+	err = c.do(ctx, http.MethodPost, "/v1/leases/"+url.PathEscape(id)+"/heartbeat", heartbeatRequestBody(expectedProvider, idleTimeout, telemetry), &res)
 	return res.Lease, err
 }
 
-func heartbeatRequestBody(idleTimeout *time.Duration, telemetry *LeaseTelemetry) map[string]any {
+func heartbeatRequestBody(expectedProvider string, idleTimeout *time.Duration, telemetry *LeaseTelemetry) map[string]any {
 	body := map[string]any{}
+	if expectedProvider != "" {
+		body["expectedProvider"] = expectedProvider
+	}
 	if idleTimeout != nil && *idleTimeout > 0 {
 		body["idleTimeoutSeconds"] = int(idleTimeout.Seconds())
 	}
@@ -1154,6 +1262,13 @@ func heartbeatRequestBody(idleTimeout *time.Duration, telemetry *LeaseTelemetry)
 		body["telemetry"] = telemetry
 	}
 	return body
+}
+
+func canonicalCoordinatorMutationProvider(expectedProvider string) (string, error) {
+	if expectedProvider == "" {
+		return "", nil
+	}
+	return canonicalProviderName(expectedProvider)
 }
 
 func (c *CoordinatorClient) Pool(ctx context.Context, cfg Config) ([]CoordinatorMachine, error) {
@@ -1463,10 +1578,22 @@ func (c *CoordinatorClient) AdminLeaseAudit(ctx context.Context, state, provider
 }
 
 func (c *CoordinatorClient) AdminReleaseLease(ctx context.Context, id string, deleteServer bool) (CoordinatorLease, error) {
+	return c.AdminReleaseLeaseForProvider(ctx, id, deleteServer, "")
+}
+
+func (c *CoordinatorClient) AdminReleaseLeaseForProvider(ctx context.Context, id string, deleteServer bool, expectedProvider string) (CoordinatorLease, error) {
 	var res struct {
 		Lease CoordinatorLease `json:"lease"`
 	}
-	err := c.do(ctx, http.MethodPost, "/v1/admin/leases/"+url.PathEscape(id)+"/release", map[string]any{"delete": deleteServer}, &res)
+	expectedProvider, err := canonicalCoordinatorMutationProvider(expectedProvider)
+	if err != nil {
+		return res.Lease, err
+	}
+	body := map[string]any{"delete": deleteServer}
+	if expectedProvider != "" {
+		body["expectedProvider"] = expectedProvider
+	}
+	err = c.do(ctx, http.MethodPost, "/v1/admin/leases/"+url.PathEscape(id)+"/release", body, &res)
 	return res.Lease, err
 }
 

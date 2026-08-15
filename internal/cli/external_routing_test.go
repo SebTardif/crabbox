@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -560,6 +561,87 @@ func TestAutoRouteExternalLeaseUsesPersistedClaimRouting(t *testing.T) {
 	}
 }
 
+func TestAutoRouteExternalLeaseAcceptsCanonicalProviderAliasClaims(t *testing.T) {
+	for _, identifier := range []string{"cbx_1257eeee0001", "legacy-external"} {
+		t.Run(identifier, func(t *testing.T) {
+			root := setExternalRoutingTestHome(t)
+			const leaseID = "cbx_1257eeee0001"
+			routing := ExternalConfig{Command: "legacy-provider", WorkRoot: "/legacy/work"}
+			if _, err := PersistExternalRouting(leaseID, routing); err != nil {
+				t.Fatal(err)
+			}
+			if err := claimLeaseForRepoProviderScope(leaseID, "legacy-external", "exec-provider", "legacy-scope", root, time.Minute, false); err != nil {
+				t.Fatal(err)
+			}
+			cfg := baseConfig()
+			cfg.Provider = "external"
+			fs := newFlagSet("test", os.Stderr)
+			if err := autoRouteExternalLease(&cfg, fs, identifier); err != nil {
+				t.Fatal(err)
+			}
+			if cfg.External.Command != routing.Command || cfg.External.WorkRoot != routing.WorkRoot || cfg.WorkRoot != routing.WorkRoot {
+				t.Fatalf("config=%#v", cfg)
+			}
+		})
+	}
+}
+
+func TestAutoRouteExternalLeaseDoesNotReplaceRecordedRun(t *testing.T) {
+	root := setExternalRoutingTestHome(t)
+	const leaseID = "cbx_1257eeee0002"
+	path, err := PersistExternalRouting(leaseID, ExternalConfig{Command: "unrelated-provider", WorkRoot: "/unrelated/work"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := claimLeaseForRepoProviderScope(leaseID, "unrelated-external", "external", "unrelated-scope", root, time.Minute, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg := baseConfig()
+	setProviderSelection(&cfg, "azure", providerSelectionRecordedRun)
+	fs := newFlagSet("recorded route", io.Discard)
+	if err := autoRouteExternalLease(&cfg, fs, "unrelated-external"); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Provider != "azure" || cfg.providerSelectionSource != providerSelectionRecordedRun || cfg.External.RoutingFile != "" {
+		t.Fatalf("recorded route changed: provider=%q source=%q external=%#v", cfg.Provider, cfg.providerSelectionSource, cfg.External)
+	}
+
+	override := baseConfig()
+	setProviderSelection(&override, "azure", providerSelectionRecordedRun)
+	overrideFS := newFlagSet("recorded route override", io.Discard)
+	overrideFS.String("external-routing-file", "", "")
+	if err := parseFlags(overrideFS, []string{"--external-routing-file", path}); err != nil {
+		t.Fatal(err)
+	}
+	if err := autoRouteExternalLease(&override, overrideFS, "unrelated-external"); err != nil {
+		t.Fatal(err)
+	}
+	if override.Provider != "external" || override.providerSelectionSource != providerSelectionFlag {
+		t.Fatalf("explicit routing flag did not override recorded route: provider=%q source=%q", override.Provider, override.providerSelectionSource)
+	}
+}
+
+func TestAutoRouteExternalLeaseRestoresAuthoritativeMetadataWithoutChangingProvenance(t *testing.T) {
+	root := setExternalRoutingTestHome(t)
+	const leaseID = "cbx_1257eeee0003"
+	routing := ExternalConfig{Command: "recorded-provider", WorkRoot: "/recorded/work"}
+	if _, err := PersistExternalRouting(leaseID, routing); err != nil {
+		t.Fatal(err)
+	}
+	if err := claimLeaseForRepoProviderScope(leaseID, "recorded-external", "external", "recorded-scope", root, time.Minute, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg := baseConfig()
+	setProviderSelection(&cfg, "external", providerSelectionRecordedRun)
+	fs := newFlagSet("recorded external route", io.Discard)
+	if err := autoRouteExternalLease(&cfg, fs, "recorded-external"); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Provider != "external" || cfg.providerSelectionSource != providerSelectionRecordedRun || cfg.External.Command != routing.Command || cfg.WorkRoot != routing.WorkRoot {
+		t.Fatalf("recorded external route not restored: provider=%q source=%q cfg=%#v", cfg.Provider, cfg.providerSelectionSource, cfg)
+	}
+}
+
 func TestAutoRouteExternalLeaseRejectsAmbiguousAlias(t *testing.T) {
 	root := setExternalRoutingTestHome(t)
 	for _, leaseID := range []string{"cbx_111111111111", "cbx_222222222222"} {
@@ -828,5 +910,79 @@ func TestLeaseTargetConfigPreservesExplicitNonExternalProvider(t *testing.T) {
 	}
 	if cfg.Provider != "aws" || cfg.External.RoutingFile != "" || !cfg.providerExplicit {
 		t.Fatalf("config=%#v", cfg)
+	}
+}
+
+func TestLeaseTargetConfigPreservesImplicitExternalClaimRouting(t *testing.T) {
+	root := setExternalRoutingTestHome(t)
+	leaseID := "cbx_1293ee000001"
+	routing := ExternalConfig{Command: "claimed-provider", WorkRoot: "/claimed/work"}
+	wantPath, err := PersistExternalRouting(leaseID, routing)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := claimLeaseForRepoProviderScope(leaseID, "claimed-external", "external", "claimed-scope", root, time.Minute, false); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(t.TempDir(), "crabbox.yaml")
+	if err := os.WriteFile(configPath, []byte("provider: aws\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CRABBOX_CONFIG", configPath)
+	defaults := defaultConfig()
+	fs := newFlagSet("status", os.Stderr)
+	provider := fs.String("provider", defaults.Provider, "")
+	targetFlags := registerTargetFlags(fs, defaults)
+	networkFlags := registerNetworkModeFlag(fs, defaults)
+	if err := parseFlags(fs, nil); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := loadLeaseTargetConfig(fs, *provider, targetFlags, networkFlags, leaseTargetConfigOptions{LeaseID: "claimed-external"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Provider != "external" || cfg.External.RoutingFile != wantPath || cfg.External.Command != routing.Command || cfg.WorkRoot != routing.WorkRoot {
+		t.Fatalf("config=%#v", cfg)
+	}
+	if cfg.providerSelectionSource != providerSelectionLeaseContext {
+		t.Fatalf("provider source=%q want %q", cfg.providerSelectionSource, providerSelectionLeaseContext)
+	}
+}
+
+func TestLeaseTargetConfigProviderResourceIDSkipsExternalRouting(t *testing.T) {
+	setupClaimRoutingCommandTest(t, parallelsProvider)
+	root := setExternalRoutingTestHome(t)
+	const leaseID = "cbx_1293ee000002"
+	routing := ExternalConfig{Command: "claimed-provider", WorkRoot: "/claimed/work"}
+	if _, err := PersistExternalRouting(leaseID, routing); err != nil {
+		t.Fatal(err)
+	}
+	if err := claimLeaseForRepoProviderScope(leaseID, "native-vm-name", "external", "claimed-scope", root, time.Minute, false); err != nil {
+		t.Fatal(err)
+	}
+
+	defaults := defaultConfig()
+	if defaults.Provider != parallelsProvider || !providerSelectionIsActionable(defaults) {
+		t.Fatalf("configured provider=%q source=%q", defaults.Provider, defaults.providerSelectionSource)
+	}
+	fs := newFlagSet("checkpoint restore", os.Stderr)
+	provider := fs.String("provider", defaults.Provider, "")
+	targetFlags := registerTargetFlags(fs, defaults)
+	networkFlags := registerNetworkModeFlag(fs, defaults)
+	if err := parseFlags(fs, nil); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := loadLeaseTargetConfig(fs, *provider, targetFlags, networkFlags, leaseTargetConfigOptions{
+		LeaseID:            "native-vm-name",
+		ProviderResourceID: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Provider != parallelsProvider || cfg.providerSelectionSource != defaults.providerSelectionSource {
+		t.Fatalf("provider=%q source=%q want %q/%q", cfg.Provider, cfg.providerSelectionSource, parallelsProvider, defaults.providerSelectionSource)
+	}
+	if cfg.External.RoutingFile != "" || cfg.External.Command != "" || cfg.External.routingLoaded || cfg.WorkRoot == routing.WorkRoot {
+		t.Fatalf("provider-native id loaded External routing: cfg=%#v external=%#v", cfg, cfg.External)
 	}
 }

@@ -22,11 +22,26 @@ Every other adapter runs direct from the CLI. A brokerable provider also runs
 direct unless a broker URL is configured (`CRABBOX_COORDINATOR`, or
 `config set-broker --url`).
 
+Coordinator-backed adapters bind every exact lease response to the provider
+selected by the CLI. Legacy responses may omit provider metadata and inherit
+that selection, but a response naming an unknown or different provider is
+rejected before the CLI converts or acts on the lease.
+
+Mutating CLI requests for release, heartbeat (including idle-timeout and
+telemetry updates), and Tailscale metadata carry the canonical selected
+provider as `expectedProvider`. The coordinator compares it with the stored
+record inside the same state transaction and returns a stable `409` identity
+error before any mutation when they differ. Omitting `expectedProvider` remains
+supported for older clients and provider-neutral portal flows; when supplied,
+it must be a nonempty normalized provider name.
+
 `broker.mode: registered` is provider-neutral. Provisioning, SSH, touch, and
 cleanup remain in the direct adapter, while the CLI idempotently registers an
 owner-scoped lease record with the coordinator. This enables portal inventory,
 sharing, and outbound WebVNC for external, KubeVirt, static SSH, local, and other
 direct SSH providers without giving the coordinator provider credentials.
+Registered inventory metadata never grants authority to select or invoke a
+different provider adapter.
 By default coordinator release and expiry remove only the registration. A
 registered lease can instead bind an outbound runtime adapter and workspace ID;
 the portal then confirms provider deletion through that adapter before removing
@@ -118,11 +133,13 @@ GET    /v1/whoami
 GET    /v1/providers/{provider}/readiness
 GET    /v1/control                       (websocket: run events + heartbeats)
 POST   /v1/leases
+PUT    /v1/leases/{canonical-id}       (fixed-ID idempotent create)
 PUT    /v1/leases/{id}/registration
 GET    /v1/leases
 GET    /v1/leases/{id-or-slug}
 POST   /v1/leases/{id-or-slug}/heartbeat
 POST   /v1/leases/{id-or-slug}/release
+POST   /v1/leases/{requested-id}/cancel-create
 POST   /v1/leases/{id-or-slug}/tailscale
 GET    /v1/leases/{id-or-slug}/share
 PUT    /v1/leases/{id-or-slug}/share
@@ -144,6 +161,35 @@ GET    /v1/adapters/{adapter-id}
 GET    /v1/adapters/{adapter-id}/agent    (websocket; one-time ticket auth)
 *      /v1/adapters/{adapter-id}/proxy/v1/workspaces/...
 ```
+
+Current CLIs bind each ordinary `POST` create to a fresh opaque attempt token
+and repeat only that same token after an ambiguous response. `cancel-create`
+persists a permanent token-bound cancellation tombstone, including when it
+arrives before the create request, and releases only the matching canonical
+generation if one was already accepted. Concurrent same-token POSTs replay that
+canonical provisioning or active lease instead of competing for its ID.
+An unbound canceled tombstone rejects only that exact owner/org/token operation;
+it does not reserve the provisional ID against a fresh token or a fixed,
+registered, or workspace lifecycle. Pending and canonical-bound attempts remain
+global ID reservations.
+Tokenless POSTs from older CLIs remain supported with their previous behavior,
+but they do not gain this cancellation guarantee. Roll out the coordinator
+before distributing a CLI that sends create attempts; once token-bound creates
+begin, do not roll the coordinator back to a version that ignores their
+tombstones. A newer CLI against an older coordinator fails cancellation closed
+rather than falling back to an unsafe ID-only release.
+
+The fixed-ID `PUT` route is fail-closed and does not replace legacy `POST`.
+It atomically reserves a versioned normalized immutable request hash before
+provider work. An identical owner-scoped replay returns an active lease or the
+same provisioning record; request drift and terminal-ID reuse return
+`lease_id_conflict` without invoking the provider. CLIs using `--lease-id`
+poll a provisioning replay until it becomes active or terminal. Coordinators
+that predate this route return not found before any create side effect.
+If the PUT response is ambiguous, the CLI repeats the full identical PUT until
+the coordinator atomically confirms the same stored intent or returns a
+conflict/definite error. Public GET is used only after that PUT confirmation,
+never to adopt an unverified fixed-ID record.
 
 Registration accepts generic provider and SSH metadata. Repeating the same
 owner/org/id/provider tuple refreshes it and reactivates an expired record.
@@ -217,6 +263,8 @@ GET    /v1/admin/hosts/...
 GET    /v1/admin/mac-hosts/...
 GET    /v1/admin/aws-orphan-sweep
 POST   /v1/admin/aws-orphan-sweep
+GET    /v1/admin/azure-orphan-sweep
+POST   /v1/admin/azure-orphan-sweep
 POST   /v1/admin/leases/{id-or-slug}/release
 POST   /v1/admin/leases/{id-or-slug}/delete
 POST   /v1/images
@@ -264,8 +312,9 @@ events are inspectable without pasting a bearer token into the browser.
 
 ## Lease lifecycle through the broker
 
-**Create.** The CLI generates the lease ID (`cbx_<12 hex>`), allocates a slug,
-mints a per-lease SSH key, then `POST /v1/leases` with the full request.
+**Create.** The CLI generates the lease ID (`cbx_<12 hex>`), a fresh opaque
+create-attempt token, a slug, and a per-lease SSH key, then `POST /v1/leases`
+with the full request.
 `createLease` (`worker/src/fleet.ts`) coerces the request into a `LeaseConfig`
 (`worker/src/config.ts`) with defaults: provider `hetzner`, TTL `5400`s (capped
 at `86400`), idle timeout `1800`s, SSH port `2222` (fallback `22`), class
@@ -282,6 +331,17 @@ updates the idle timeout **only** when the request explicitly sends a positive
 `idleTimeoutSeconds` (clamped to `86400`); telemetry samples may ride along in
 the same body.
 
+**Cancel create.** If the caller cancels an ordinary create, the CLI sends
+`POST /v1/leases/{requested-id}/cancel-create` with the exact create-attempt
+token on a cancellation-independent bounded context. The coordinator persists
+the canceled tombstone even when cancellation arrives first. When a matching
+canonical lease exists, its released state and durable cleanup claim are written
+under the same state lock before provider deletion, so ordinary maintenance can
+resume cleanup after a restart. It releases a reserved, provisioning, or
+retained canonical lease only when its private token, owner/org, and retained
+generation match; otherwise it fails closed. Fixed-ID `PUT` creates remain
+replay-owned and never use cancellation cleanup.
+
 **Release.** `POST /v1/leases/{id}/release` (body `{delete?}`, defaulting to
 `!keep`) deletes the cloud server when the lease is still active and sets state
 `released`. For a registered lease bound to a runtime-adapter workspace,
@@ -293,11 +353,12 @@ request 404s or 401s.
 
 **Expiry and cleanup.** A DO alarm and the cron both run maintenance:
 `expireLeases` deletes cloud servers for active leases past `expiresAt`
-(state `expired`), retrying after ~5 minutes on failure, and an AWS orphan sweep
-(report or delete, gated by `CRABBOX_AWS_ORPHAN_SWEEP_*`) reports untracked
-instances and deletes or releases only resources with exact retained coordinator
-bindings. The next alarm is scheduled for
-the soonest upcoming expiry or sweep time.
+(state `expired`), retrying after ~5 minutes on failure, and the AWS and Azure
+orphan sweeps report untracked provider resources and delete or release only
+resources with exact retained coordinator bindings. Each sweep is gated by its
+provider-specific settings. See [Lifecycle and cleanup](lifecycle-cleanup.md)
+for the detailed cleanup rules. The next alarm is scheduled for the soonest
+upcoming expiry or sweep time.
 
 Lease responses carry the canonical `cbx_...` ID, the friendly slug when present,
 provider metadata, owner/org, `createdAt`, `lastTouchedAt`, `idleTimeoutSeconds`,

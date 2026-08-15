@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -83,6 +84,270 @@ func TestDoctorLocalToolsAreProviderAware(t *testing.T) {
 	}
 }
 
+func TestDoctorProviderSelectionProvenanceAndStrictness(t *testing.T) {
+	tests := []struct {
+		name       string
+		args       []string
+		setup      func(*testing.T)
+		wantSource providerSelectionSource
+		wantOK     bool
+	}{
+		{
+			name:       "compiled default",
+			wantSource: providerSelectionCompiledDefault,
+			wantOK:     true,
+		},
+		{
+			name:       "provider flag",
+			args:       []string{"--provider", "hetzner"},
+			wantSource: providerSelectionFlag,
+		},
+		{
+			name: "environment",
+			setup: func(t *testing.T) {
+				t.Setenv("CRABBOX_PROVIDER", "hetzner")
+			},
+			wantSource: providerSelectionEnvironment,
+		},
+		{
+			name: "repository config",
+			setup: func(t *testing.T) {
+				if err := os.WriteFile(".crabbox.yaml", []byte("provider: hetzner\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+			wantSource: providerSelectionRepoConfig,
+		},
+		{
+			name: "user config with selected profile",
+			setup: func(t *testing.T) {
+				path := userConfigPath()
+				if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				body := "provider: hetzner\nprofile: qa\nprofiles:\n  qa:\n    doctor:\n      enabled: false\n"
+				if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+			wantSource: providerSelectionUserConfig,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			isolateDoctorProviderSelectionTest(t)
+			if tt.setup != nil {
+				tt.setup(t)
+			}
+			var stdout, stderr bytes.Buffer
+			err := (App{Stdout: &stdout, Stderr: &stderr}).doctor(context.Background(), tt.args)
+			if tt.wantOK {
+				if err != nil {
+					t.Fatalf("doctor error=%v stdout=%q stderr=%q", err, stdout.String(), stderr.String())
+				}
+				if !strings.Contains(stdout.String(), "provider-selection no provider selected source=compiled_default selected=false") ||
+					!strings.Contains(stdout.String(), "warning provider no provider selected source=compiled_default selected=false readiness=skipped") {
+					t.Fatalf("doctor did not skip compiled-default readiness:\n%s", stdout.String())
+				}
+			} else {
+				var exitErr ExitError
+				if !AsExitError(err, &exitErr) || exitErr.Code != 1 {
+					t.Fatalf("doctor error=%v, want exit 1; stdout=%q stderr=%q", err, stdout.String(), stderr.String())
+				}
+				if !strings.Contains(stdout.String(), "failed  provider provider=hetzner") || !strings.Contains(stdout.String(), "HCLOUD_TOKEN or HETZNER_TOKEN is required") {
+					t.Fatalf("doctor did not preserve strict provider readiness:\n%s", stdout.String())
+				}
+			}
+			wantSelection := "provider-selection provider=hetzner source=" + string(tt.wantSource) + " selected=true"
+			if tt.wantSource == providerSelectionCompiledDefault {
+				wantSelection = "provider-selection no provider selected source=compiled_default selected=false"
+			}
+			if !strings.Contains(stdout.String(), wantSelection) {
+				t.Fatalf("doctor selection provenance missing %q:\n%s", wantSelection, stdout.String())
+			}
+		})
+	}
+}
+
+func TestDoctorCompiledDefaultSkipsCoordinatorProviderReadiness(t *testing.T) {
+	isolateDoctorProviderSelectionTest(t)
+	readinessCalled := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/health":
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+		case "/v1/whoami":
+			_ = json.NewEncoder(w).Encode(CoordinatorWhoami{Auth: "token", Owner: "alice@example.test", Org: "example-org"})
+		case "/v1/providers/hetzner/readiness":
+			readinessCalled = true
+			http.Error(w, "compiled-default readiness should be skipped", http.StatusInternalServerError)
+		default:
+			http.Error(w, "unexpected "+r.URL.Path, http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+	t.Setenv("CRABBOX_COORDINATOR", server.URL)
+	t.Setenv("CRABBOX_COORDINATOR_TOKEN", "token")
+
+	var stdout, stderr bytes.Buffer
+	if err := (App{Stdout: &stdout, Stderr: &stderr}).doctor(context.Background(), nil); err != nil {
+		t.Fatalf("doctor error=%v stdout=%q stderr=%q", err, stdout.String(), stderr.String())
+	}
+	if readinessCalled {
+		t.Fatal("doctor called coordinator readiness for the compiled default")
+	}
+	for _, want := range []string{"ok      coord", "ok      broker", "warning provider no provider selected source=compiled_default selected=false readiness=skipped"} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("doctor output missing %q:\n%s", want, stdout.String())
+		}
+	}
+	if strings.Contains(stdout.String(), "default_type") || strings.Contains(stdout.String(), "ccx63") {
+		t.Fatalf("provider-neutral doctor exposed a provider default type:\n%s", stdout.String())
+	}
+}
+
+func TestDoctorCompiledDefaultJSONReportsSkippedReadiness(t *testing.T) {
+	isolateDoctorProviderSelectionTest(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/health":
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+		case "/v1/whoami":
+			_ = json.NewEncoder(w).Encode(CoordinatorWhoami{Auth: "token", Owner: "alice@example.test", Org: "example-org"})
+		default:
+			http.Error(w, "unexpected "+r.URL.Path, http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+	t.Setenv("CRABBOX_COORDINATOR", server.URL)
+	t.Setenv("CRABBOX_COORDINATOR_TOKEN", "token")
+	var stdout, stderr bytes.Buffer
+	if err := (App{Stdout: &stdout, Stderr: &stderr}).doctor(context.Background(), []string{"--json"}); err != nil {
+		t.Fatalf("doctor error=%v stdout=%q stderr=%q", err, stdout.String(), stderr.String())
+	}
+	var view doctorJSONOutput
+	if err := json.Unmarshal(stdout.Bytes(), &view); err != nil {
+		t.Fatalf("doctor JSON invalid: %v\n%s", err, stdout.String())
+	}
+	if !view.OK || view.Provider != "" {
+		t.Fatalf("doctor view=%#v", view)
+	}
+	var selection, readiness, broker bool
+	for _, check := range view.Checks {
+		selection = selection || (check.Check == "provider-selection" && check.Details["provider"] == "" && check.Details["source"] == "compiled_default" && check.Details["selected"] == "false")
+		readiness = readiness || (check.Check == "provider" && check.Status == "warning" && check.Details["provider"] == "" && check.Details["selected"] == "false" && check.Details["readiness"] == "skipped")
+		broker = broker || check.Check == "broker"
+	}
+	if !selection || !readiness || !broker {
+		t.Fatalf("doctor JSON missing provenance or skip: %#v", view.Checks)
+	}
+	for _, check := range view.Checks {
+		if _, ok := check.Details["default_type"]; ok || strings.Contains(check.Message, "default_type") || strings.Contains(check.Message, "ccx63") {
+			t.Fatalf("provider-neutral doctor JSON exposed a provider default type: %#v", check)
+		}
+	}
+}
+
+func TestDoctorExplicitProviderJSONReportsSelected(t *testing.T) {
+	isolateDoctorProviderSelectionTest(t)
+	var stdout, stderr bytes.Buffer
+	if err := (App{Stdout: &stdout, Stderr: &stderr}).doctor(context.Background(), []string{"--provider", "ssh", "--json"}); err != nil {
+		t.Fatalf("doctor error=%v stdout=%q stderr=%q", err, stdout.String(), stderr.String())
+	}
+	var view doctorJSONOutput
+	if err := json.Unmarshal(stdout.Bytes(), &view); err != nil {
+		t.Fatalf("doctor JSON invalid: %v\n%s", err, stdout.String())
+	}
+	if !view.OK || view.Provider != "ssh" {
+		t.Fatalf("doctor view=%#v", view)
+	}
+	for _, check := range view.Checks {
+		if check.Check == "provider-selection" && check.Details["provider"] == "ssh" && check.Details["source"] == "flag" && check.Details["selected"] == "true" {
+			return
+		}
+	}
+	t.Fatalf("doctor JSON missing selected provider provenance: %#v", view.Checks)
+}
+
+func TestDoctorConfiguredProviderKeepsCoordinatorReadinessStrict(t *testing.T) {
+	isolateDoctorProviderSelectionTest(t)
+	t.Setenv("CRABBOX_PROVIDER", "aws")
+	readinessCalled := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/health":
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+		case "/v1/whoami":
+			_ = json.NewEncoder(w).Encode(CoordinatorWhoami{Auth: "token", Owner: "alice@example.test", Org: "example-org"})
+		case "/v1/providers/aws/readiness":
+			readinessCalled = true
+			_ = json.NewEncoder(w).Encode(CoordinatorProviderReadiness{Provider: "aws", Configured: false, Missing: []string{"AWS_ACCESS_KEY_ID"}})
+		default:
+			http.Error(w, "unexpected "+r.URL.Path, http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+	t.Setenv("CRABBOX_COORDINATOR", server.URL)
+	t.Setenv("CRABBOX_COORDINATOR_TOKEN", "token")
+
+	var stdout, stderr bytes.Buffer
+	err := (App{Stdout: &stdout, Stderr: &stderr}).doctor(context.Background(), nil)
+	var exitErr ExitError
+	if !AsExitError(err, &exitErr) || exitErr.Code != 1 {
+		t.Fatalf("doctor error=%v, want exit 1; stdout=%q stderr=%q", err, stdout.String(), stderr.String())
+	}
+	if !readinessCalled {
+		t.Fatal("doctor skipped coordinator readiness for a configured provider")
+	}
+	for _, want := range []string{"provider-selection provider=aws source=environment", "failed  provider provider=aws missing=AWS_ACCESS_KEY_ID"} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("doctor output missing %q:\n%s", want, stdout.String())
+		}
+	}
+}
+
+func TestDoctorCompiledDefaultStillFailsProviderNeutralReadinessChecks(t *testing.T) {
+	isolateDoctorProviderSelectionTest(t)
+	t.Setenv("PATH", doctorTestToolPath(t, nil))
+
+	var stdout, stderr bytes.Buffer
+	err := (App{Stdout: &stdout, Stderr: &stderr}).doctor(context.Background(), nil)
+	var exitErr ExitError
+	if !AsExitError(err, &exitErr) || exitErr.Code != 1 {
+		t.Fatalf("doctor error=%v, want exit 1; stdout=%q stderr=%q", err, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "missing git") || !strings.Contains(stdout.String(), "readiness=skipped") || strings.Contains(stdout.String(), "missing ssh") {
+		t.Fatalf("doctor did not preserve non-provider failures:\n%s", stdout.String())
+	}
+}
+
+func isolateDoctorProviderSelectionTest(t *testing.T) {
+	t.Helper()
+	clearConfigEnv(t)
+	t.Setenv("CRABBOX_CONFIG", "")
+	t.Setenv("CRABBOX_PROVIDER", "")
+	t.Setenv("CRABBOX_PROFILE", "")
+	t.Setenv("CRABBOX_COORDINATOR", "")
+	t.Setenv("CRABBOX_COORDINATOR_TOKEN", "")
+	t.Setenv("HCLOUD_TOKEN", "")
+	t.Setenv("HETZNER_TOKEN", "")
+	t.Chdir(t.TempDir())
+	t.Setenv("PATH", doctorTestToolPath(t, []string{"git", "ssh", "ssh-keygen", "rsync"}))
+}
+
+func doctorTestToolPath(t *testing.T, tools []string) string {
+	t.Helper()
+	dir := t.TempDir()
+	for _, tool := range tools {
+		path := filepath.Join(dir, tool)
+		if err := os.WriteFile(path, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return dir
+}
+
 func TestDoctorRejectsUnsupportedProviderTarget(t *testing.T) {
 	for _, tool := range []string{"git", "ssh", "ssh-keygen", "rsync"} {
 		if _, err := exec.LookPath(tool); err != nil {
@@ -148,6 +413,72 @@ printf 'jq=jq-1.7\n'
 	if !strings.Contains(stdout.String(), "ok      remote   cbx_existing") {
 		t.Fatalf("doctor --id did not continue to remote checks: %q", stdout.String())
 	}
+}
+
+func TestDoctorIDUsesSharedLeaseIdentifierRouting(t *testing.T) {
+	t.Run("ordinary claim", func(t *testing.T) {
+		t.Setenv("XDG_STATE_HOME", t.TempDir())
+		setupClaimRoutingCommandTest(t, claimRoutingUnusableProvider)
+		t.Setenv("PATH", doctorTestToolPath(t, []string{"git", "ssh", "ssh-keygen", "rsync"}))
+		mustWriteClaimRoutingTestClaim(t, "cbx_doctor_claim", "doctor-claim", claimRoutingUsableProvider)
+
+		var stdout bytes.Buffer
+		err := (App{Stdout: &stdout, Stderr: io.Discard}).doctor(context.Background(), []string{"--id", "doctor-claim"})
+		if err != nil {
+			t.Fatalf("doctor error=%v\n%s", err, stdout.String())
+		}
+		if !strings.Contains(stdout.String(), "provider-selection provider="+claimRoutingUsableProvider+" source=lease_context") {
+			t.Fatalf("doctor did not route ordinary claim:\n%s", stdout.String())
+		}
+	})
+
+	t.Run("static claim", func(t *testing.T) {
+		isolateDoctorProviderSelectionTest(t)
+		t.Setenv("XDG_STATE_HOME", t.TempDir())
+		claimed := baseConfig()
+		claimed.Provider = staticProvider
+		claimed.Static.Host = "doctor-static.example.test"
+		claimed.Static.User = "runner"
+		if err := claimLeaseForRepoConfig("static_doctor", "doctor-static", claimed, "/repo", time.Minute, false); err != nil {
+			t.Fatal(err)
+		}
+
+		var stdout bytes.Buffer
+		err := (App{Stdout: &stdout, Stderr: io.Discard}).doctor(context.Background(), []string{"--id", "doctor-static"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(stdout.String(), "provider-selection provider=ssh source=lease_context") {
+			t.Fatalf("doctor did not route Static claim:\n%s", stdout.String())
+		}
+	})
+
+	t.Run("external claim", func(t *testing.T) {
+		clearConfigEnv(t)
+		root := setExternalRoutingTestHome(t)
+		t.Setenv("CRABBOX_CONFIG", filepath.Join(t.TempDir(), "missing.yaml"))
+		t.Setenv("PATH", doctorTestToolPath(t, []string{"git", "ssh", "ssh-keygen", "rsync"}))
+		const leaseID = "cbx_doctor_external"
+		if _, err := PersistExternalRouting(leaseID, ExternalConfig{Command: "doctor-external", WorkRoot: "/work/doctor"}); err != nil {
+			t.Fatal(err)
+		}
+		if err := claimLeaseForRepoProviderScope(leaseID, "doctor-external", "external", "doctor-scope", root, time.Minute, false); err != nil {
+			t.Fatal(err)
+		}
+		testExternalResolveHook = func(req ResolveRequest) (LeaseTarget, error) {
+			return LeaseTarget{LeaseID: leaseID, Server: Server{Provider: "external", CloudID: leaseID}, SSH: SSHTarget{Host: "doctor-external.example.test", User: "runner", Port: "22", TargetOS: targetLinux}}, nil
+		}
+		t.Cleanup(func() { testExternalResolveHook = nil })
+
+		var stdout bytes.Buffer
+		err := (App{Stdout: &stdout, Stderr: io.Discard}).doctor(context.Background(), []string{"--id", "doctor-external"})
+		if err != nil {
+			t.Fatalf("doctor error=%v\n%s", err, stdout.String())
+		}
+		if !strings.Contains(stdout.String(), "provider-selection provider=external source=lease_context") {
+			t.Fatalf("doctor did not route External claim:\n%s", stdout.String())
+		}
+	})
 }
 
 func TestDoctorDoesNotPrepareExistingLease(t *testing.T) {
@@ -249,12 +580,53 @@ func TestDoctorFromRunAppliesRecordedContext(t *testing.T) {
 	text := stdout.String()
 	for _, want := range []string{
 		"warning run      run=run_123 provider=proxmox target=linux class=standard type=vm-large lease=- phase=test missing=leaseID",
+		"provider-selection provider=proxmox source=recorded_run",
 		"skip    remote   from_run=run_123 lease=missing remote_checks=skipped",
 		"skip    provider provider=proxmox direct_doctor=unsupported",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("doctor --from-run output missing %q:\n%s", want, text)
 		}
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	err = (App{Stdout: &stdout, Stderr: &stderr}).doctor(context.Background(), []string{"--from-run", "run_123", "--provider", "proxmox"})
+	if err != nil {
+		t.Fatalf("doctor --from-run --provider error=%v stdout=%q stderr=%q", err, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "provider-selection provider=proxmox source=flag") {
+		t.Fatalf("explicit provider did not retain flag provenance:\n%s", stdout.String())
+	}
+}
+
+func TestDoctorFromRunProviderSurvivesUnrelatedIdentifierClaim(t *testing.T) {
+	clearConfigEnv(t)
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	t.Setenv("CRABBOX_CONFIG", filepath.Join(t.TempDir(), "missing.yaml"))
+	t.Setenv("PATH", doctorTestToolPath(t, []string{"git", "ssh", "ssh-keygen", "rsync"}))
+	if err := claimLeaseForRepoProvider("cbx_recorded_doctor", "recorded-doctor", "external", "/repo", time.Minute, false); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/v1/runs/run_recorded_claim" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"run": CoordinatorRun{
+			ID: "run_recorded_claim", Provider: claimRoutingUsableProvider, TargetOS: targetLinux,
+			Class: "standard", ServerType: "test", LeaseID: "recorded-doctor", Phase: "test",
+		}})
+	}))
+	defer server.Close()
+	t.Setenv("CRABBOX_COORDINATOR", server.URL)
+
+	var stdout bytes.Buffer
+	err := (App{Stdout: &stdout, Stderr: io.Discard}).doctor(context.Background(), []string{"--from-run", "run_recorded_claim"})
+	if err != nil {
+		t.Fatalf("doctor error=%v\n%s", err, stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "provider-selection provider="+claimRoutingUsableProvider+" source=recorded_run") {
+		t.Fatalf("recorded provider was replaced by identifier claim:\n%s", stdout.String())
 	}
 }
 
@@ -333,6 +705,7 @@ func TestDoctorJSONCoordinatorOutput(t *testing.T) {
 	}
 	found := false
 	foundCoordinator := false
+	foundBrokerDefault := false
 	for _, check := range view.Checks {
 		if check.Check == "coord" {
 			foundCoordinator = true
@@ -348,12 +721,18 @@ func TestDoctorJSONCoordinatorOutput(t *testing.T) {
 		if check.Check == "provider" && check.Details["provider"] == "aws" && check.Details["coordinator_secrets"] == "ready" {
 			found = true
 		}
+		if check.Check == "broker" && check.Details["default_type"] != "" && strings.Contains(check.Message, "default_type="+check.Details["default_type"]) {
+			foundBrokerDefault = true
+		}
 	}
 	if !foundCoordinator {
 		t.Fatalf("coordinator check missing from JSON: %#v", view.Checks)
 	}
 	if !found {
 		t.Fatalf("provider readiness missing from JSON: %#v", view.Checks)
+	}
+	if !foundBrokerDefault {
+		t.Fatalf("selected provider default type missing from broker JSON: %#v", view.Checks)
 	}
 }
 

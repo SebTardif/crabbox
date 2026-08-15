@@ -114,6 +114,115 @@ func TestAutoRouteStaticLeaseRestoresFriendlySlugClaim(t *testing.T) {
 	}
 }
 
+func TestAutoRouteStaticLeasePreservesAuthoritativeProvider(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	claimed := baseConfig()
+	claimed.Provider = staticProvider
+	claimed.Static.Host = "authoritative.example.com"
+	claimed.Static.User = "builder"
+	if err := claimLeaseForRepoConfig("static_authoritative", "authoritative-static", claimed, "/repo", time.Minute, false); err != nil {
+		t.Fatal(err)
+	}
+	fs := newFlagSet("authoritative static route", io.Discard)
+	registerTargetFlags(fs, baseConfig())
+	if err := parseFlags(fs, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	nonStatic := baseConfig()
+	setProviderSelection(&nonStatic, "azure", providerSelectionRecordedRun)
+	if err := autoRouteStaticLease(&nonStatic, fs, "authoritative-static"); err != nil {
+		t.Fatal(err)
+	}
+	if nonStatic.Provider != "azure" || nonStatic.providerSelectionSource != providerSelectionRecordedRun || nonStatic.Static.Host != "" {
+		t.Fatalf("non-static authoritative route changed: provider=%q source=%q static=%#v", nonStatic.Provider, nonStatic.providerSelectionSource, nonStatic.Static)
+	}
+
+	static := baseConfig()
+	setProviderSelection(&static, staticProvider, providerSelectionRecordedRun)
+	if err := autoRouteStaticLease(&static, fs, "authoritative-static"); err != nil {
+		t.Fatal(err)
+	}
+	if static.Provider != staticProvider || static.providerSelectionSource != providerSelectionRecordedRun || static.Static.Host != claimed.Static.Host {
+		t.Fatalf("static authoritative route=%q source=%q static=%#v", static.Provider, static.providerSelectionSource, static.Static)
+	}
+}
+
+func TestLeaseTargetConfigPreservesImplicitStaticClaimRouting(t *testing.T) {
+	isolateTestUserDirs(t)
+	claimed := baseConfig()
+	claimed.Provider = staticProvider
+	claimed.Static.Host = "claimed-static.example.com"
+	claimed.Static.User = "builder"
+	claimed.Static.Port = "2202"
+	claimed.Static.WorkRoot = "/work/claimed-static"
+	claimed.TargetOS = targetMacOS
+	if err := claimLeaseForRepoConfig("static_claimed-static", "claimed-static", claimed, "/repo", time.Minute, false); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(t.TempDir(), "crabbox.yaml")
+	if err := os.WriteFile(configPath, []byte("provider: aws\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CRABBOX_CONFIG", configPath)
+	defaults := defaultConfig()
+	fs := newFlagSet("status", io.Discard)
+	provider := fs.String("provider", defaults.Provider, "")
+	targetFlags := registerTargetFlags(fs, defaults)
+	networkFlags := registerNetworkModeFlag(fs, defaults)
+	if err := parseFlags(fs, nil); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := loadLeaseTargetConfig(fs, *provider, targetFlags, networkFlags, leaseTargetConfigOptions{LeaseID: "claimed-static"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Provider != staticProvider || cfg.Static.Host != claimed.Static.Host || cfg.Static.User != claimed.Static.User || cfg.Static.Port != claimed.Static.Port || cfg.WorkRoot != claimed.Static.WorkRoot || cfg.TargetOS != targetMacOS {
+		t.Fatalf("config=%#v static=%#v", cfg, cfg.Static)
+	}
+	if cfg.providerSelectionSource != providerSelectionLeaseContext {
+		t.Fatalf("provider source=%q want %q", cfg.providerSelectionSource, providerSelectionLeaseContext)
+	}
+}
+
+func TestLeaseTargetConfigProviderResourceIDSkipsStaticRouting(t *testing.T) {
+	setupClaimRoutingCommandTest(t, parallelsProvider)
+	claimed := baseConfig()
+	claimed.Provider = staticProvider
+	claimed.Static.Host = "builder.example.com"
+	claimed.Static.User = "builder"
+	claimed.Static.Port = "2202"
+	claimed.Static.WorkRoot = "/work/static-builder"
+	if err := claimLeaseForRepoConfig("static_builder", "builder", claimed, "/repo", time.Minute, false); err != nil {
+		t.Fatal(err)
+	}
+
+	defaults := defaultConfig()
+	if defaults.Provider != parallelsProvider || !providerSelectionIsActionable(defaults) {
+		t.Fatalf("configured provider=%q source=%q", defaults.Provider, defaults.providerSelectionSource)
+	}
+	fs := newFlagSet("checkpoint list", io.Discard)
+	provider := fs.String("provider", defaults.Provider, "")
+	targetFlags := registerTargetFlags(fs, defaults)
+	networkFlags := registerNetworkModeFlag(fs, defaults)
+	if err := parseFlags(fs, nil); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := loadLeaseTargetConfig(fs, *provider, targetFlags, networkFlags, leaseTargetConfigOptions{
+		LeaseID:            "static_builder",
+		ProviderResourceID: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Provider != parallelsProvider || cfg.providerSelectionSource != defaults.providerSelectionSource {
+		t.Fatalf("provider=%q source=%q want %q/%q", cfg.Provider, cfg.providerSelectionSource, parallelsProvider, defaults.providerSelectionSource)
+	}
+	if cfg.Static.ID != "" || cfg.Static.Name != "" || cfg.Static.Host != "" || cfg.Static.User != "" || cfg.Static.Port != "" || cfg.Static.WorkRoot != "" {
+		t.Fatalf("provider-native id loaded Static config: %#v", cfg.Static)
+	}
+}
+
 func TestAutoRouteStaticLeaseDoesNotGuessHostWithoutClaim(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	defaults := baseConfig()

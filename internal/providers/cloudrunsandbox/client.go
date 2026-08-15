@@ -70,7 +70,7 @@ var newTransport = func(cfg Config, rt Runtime) (sandboxTransport, error) {
 		}
 		httpClient := rt.HTTP
 		if httpClient == nil {
-			httpClient = &http.Client{Timeout: 60 * time.Second}
+			httpClient = http.DefaultClient
 		}
 		return &remoteTransport{
 			baseURL:   validated,
