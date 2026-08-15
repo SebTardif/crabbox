@@ -10,23 +10,10 @@ import (
 	"os"
 	"path"
 	"strings"
-	"sync"
-	"sync/atomic"
-	"time"
 
 	apidaytona "github.com/daytonaio/daytona/libs/api-client-go"
 	sdkdaytona "github.com/daytonaio/daytona/libs/sdk-go/pkg/daytona"
 )
-
-func transferAwareHTTPClient() *http.Client {
-	return newDaytonaTransferHTTPClient(60 * time.Second)
-}
-
-func newDaytonaTransferHTTPClient(responseHeaderTimeout time.Duration) *http.Client {
-	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.ResponseHeaderTimeout = responseHeaderTimeout
-	return &http.Client{Timeout: 0, Transport: transport}
-}
 
 func (b *daytonaLeaseBackend) uploadDaytonaArchive(ctx context.Context, sandboxID, archivePath string, archive *os.File) error {
 	client, err := newDaytonaClient(b.cfg, b.rt)
@@ -47,8 +34,7 @@ func (b *daytonaLeaseBackend) uploadDaytonaArchive(ctx context.Context, sandboxI
 	}
 	httpClient := b.rt.HTTP
 	if httpClient == nil {
-		// Streaming archive uploads can exceed 60s; bound dial/headers only.
-		httpClient = transferAwareHTTPClient()
+		httpClient = http.DefaultClient
 	}
 	return uploadDaytonaFileStream(ctx, httpClient, endpoint, headers, archive, path.Base(archivePath))
 }
@@ -87,10 +73,14 @@ func daytonaToolboxHeaders(cfg Config) (map[string]string, error) {
 
 func uploadDaytonaFileStream(ctx context.Context, client *http.Client, endpoint string, headers map[string]string, file io.Reader, filename string) error {
 	if client == nil {
-		client = transferAwareHTTPClient()
+		client = http.DefaultClient
 	}
 	pr, pw := io.Pipe()
 	writer := multipart.NewWriter(pw)
+	writeDone := make(chan error, 1)
+	go func() {
+		writeDone <- writeMultipartFile(pw, writer, file, filename)
+	}()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, pr)
 	if err != nil {
 		_ = pr.CloseWithError(err)
@@ -102,39 +92,14 @@ func uploadDaytonaFileStream(ctx context.Context, client *http.Client, endpoint 
 	for key, value := range headers {
 		req.Header.Set(key, value)
 	}
-	writeDone := make(chan error, 1)
-	producerDone := make(chan struct{})
-	lifecycle := &daytonaMultipartLifecycle{pr: pr, pw: pw, source: file}
-	go func() {
-		writeErr := writeMultipartFile(pw, writer, file, filename)
-		lifecycle.finishProduction()
-		writeDone <- writeErr
-		close(producerDone)
-	}()
-	watcherStop := make(chan struct{})
-	watcherDone := make(chan struct{})
-	go func() {
-		defer close(watcherDone)
-		select {
-		case <-ctx.Done():
-			lifecycle.cancel(ctx.Err())
-		case <-producerDone:
-		case <-watcherStop:
-		}
-	}()
-	defer func() {
-		close(watcherStop)
-		<-watcherDone
-	}()
 	resp, err := client.Do(req)
 	if err != nil {
-		stopDaytonaMultipartProducer(lifecycle, writeDone, err)
+		_ = pr.CloseWithError(err)
 		return fmt.Errorf("daytona upload archive: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= http.StatusBadRequest {
-		statusErr := fmt.Errorf("daytona upload archive: %s", resp.Status)
-		stopDaytonaMultipartProducer(lifecycle, writeDone, statusErr)
+		_ = pr.CloseWithError(fmt.Errorf("daytona upload archive: %s", resp.Status))
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		if len(body) > 0 {
 			message := strings.TrimSpace(redactDaytonaSecrets(string(body), daytonaHeaderSecrets(headers)...))
@@ -148,42 +113,6 @@ func uploadDaytonaFileStream(ctx context.Context, client *http.Client, endpoint 
 	}
 	_, _ = io.Copy(io.Discard, resp.Body)
 	return nil
-}
-
-const (
-	daytonaMultipartActive uint32 = iota
-	daytonaMultipartFinished
-	daytonaMultipartCanceled
-)
-
-type daytonaMultipartLifecycle struct {
-	pr        *io.PipeReader
-	pw        *io.PipeWriter
-	source    io.Reader
-	state     atomic.Uint32
-	closeOnce sync.Once
-}
-
-func (l *daytonaMultipartLifecycle) finishProduction() {
-	l.state.CompareAndSwap(daytonaMultipartActive, daytonaMultipartFinished)
-}
-
-func (l *daytonaMultipartLifecycle) cancel(cause error) {
-	if !l.state.CompareAndSwap(daytonaMultipartActive, daytonaMultipartCanceled) && l.state.Load() != daytonaMultipartCanceled {
-		return
-	}
-	l.closeOnce.Do(func() {
-		_ = l.pr.CloseWithError(cause)
-		_ = l.pw.CloseWithError(cause)
-		if closer, ok := l.source.(io.Closer); ok {
-			_ = closer.Close()
-		}
-	})
-}
-
-func stopDaytonaMultipartProducer(lifecycle *daytonaMultipartLifecycle, writeDone <-chan error, cause error) {
-	lifecycle.cancel(cause)
-	<-writeDone
 }
 
 func writeMultipartFile(pipe *io.PipeWriter, writer *multipart.Writer, file io.Reader, filename string) error {
