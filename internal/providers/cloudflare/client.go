@@ -16,6 +16,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	core "github.com/openclaw/crabbox/internal/cli"
 )
 
 type cloudflareClient struct {
@@ -122,7 +124,7 @@ func cloudflareCleanupContext() (context.Context, context.CancelFunc) {
 }
 
 func defaultCloudflareHTTPClient() *http.Client {
-	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport := core.CloneDefaultTransport()
 	transport.ResponseHeaderTimeout = cloudflareDefaultResponseHeaderTimeout
 	return &http.Client{Transport: transport}
 }

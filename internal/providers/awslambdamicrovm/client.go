@@ -18,6 +18,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/lambdamicrovms"
 	lambdatypes "github.com/aws/aws-sdk-go-v2/service/lambdamicrovms/types"
 	"github.com/aws/smithy-go"
+
+	core "github.com/openclaw/crabbox/internal/cli"
 )
 
 type microVM struct {
@@ -211,7 +213,7 @@ func newRunnerClient(control controlPlane, source *http.Client, region string) *
 }
 
 func defaultRunnerHTTPClient(responseHeaderTimeout time.Duration) *http.Client {
-	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport := core.CloneDefaultTransport()
 	transport.ResponseHeaderTimeout = responseHeaderTimeout
 	return &http.Client{Transport: transport}
 }

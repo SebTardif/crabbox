@@ -158,6 +158,32 @@ func TestCloudflareClientUsesBoundedDefaultTransport(t *testing.T) {
 	}
 }
 
+type unusedDefaultRoundTripper struct{}
+
+func (unusedDefaultRoundTripper) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, fmt.Errorf("unused default transport")
+}
+
+func TestDefaultCloudflareHTTPClientAcceptsNonTransportDefault(t *testing.T) {
+	original := http.DefaultTransport
+	t.Cleanup(func() {
+		http.DefaultTransport = original
+	})
+	http.DefaultTransport = unusedDefaultRoundTripper{}
+
+	client := defaultCloudflareHTTPClient()
+	if client == nil {
+		t.Fatal("default client is nil")
+	}
+	transport, ok := client.Transport.(*http.Transport)
+	if !ok || transport == nil {
+		t.Fatalf("transport=%T, want non-nil *http.Transport", client.Transport)
+	}
+	if transport.ResponseHeaderTimeout != cloudflareDefaultResponseHeaderTimeout {
+		t.Fatalf("response header timeout=%s, want %s", transport.ResponseHeaderTimeout, cloudflareDefaultResponseHeaderTimeout)
+	}
+}
+
 func TestCloudflareClientRejectsCrossOriginExecRedirectBeforeReplay(t *testing.T) {
 	for _, status := range []int{http.StatusTemporaryRedirect, http.StatusPermanentRedirect} {
 		t.Run(http.StatusText(status), func(t *testing.T) {

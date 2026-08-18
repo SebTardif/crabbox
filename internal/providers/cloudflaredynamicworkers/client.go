@@ -11,6 +11,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	core "github.com/openclaw/crabbox/internal/cli"
 )
 
 type loaderAPI interface {
@@ -291,7 +293,7 @@ func isLoopbackHTTPURL(parsed *url.URL) bool {
 }
 
 func defaultHTTPClient(cfg Config) *http.Client {
-	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport := core.CloneDefaultTransport()
 	transport.ResponseHeaderTimeout = responseHeaderTimeout(cfg)
 	return &http.Client{Transport: transport}
 }

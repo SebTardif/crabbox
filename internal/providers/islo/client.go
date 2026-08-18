@@ -19,6 +19,8 @@ import (
 	"github.com/islo-labs/go-sdk/client"
 	"github.com/islo-labs/go-sdk/customauth"
 	"github.com/islo-labs/go-sdk/option"
+
+	core "github.com/openclaw/crabbox/internal/cli"
 	"github.com/openclaw/crabbox/internal/providers/shared"
 )
 
@@ -93,7 +95,7 @@ func isloCleanupContext() (context.Context, context.CancelFunc) {
 }
 
 func defaultIsloHTTPClient() *http.Client {
-	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport := core.CloneDefaultTransport()
 	transport.ResponseHeaderTimeout = isloDefaultResponseHeaderTimeout
 	return &http.Client{Transport: transport}
 }

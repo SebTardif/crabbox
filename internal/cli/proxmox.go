@@ -86,7 +86,7 @@ func NewProxmoxClient(cfg Config) (*ProxmoxClient, error) {
 	}
 	client := &http.Client{Timeout: 60 * time.Second}
 	if cfg.Proxmox.InsecureTLS {
-		transport := http.DefaultTransport.(*http.Transport).Clone()
+		transport := CloneDefaultTransport()
 		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec // User opt-in for self-signed private Proxmox clusters.
 		client.Transport = transport
 	}

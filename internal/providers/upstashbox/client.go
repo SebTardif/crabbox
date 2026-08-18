@@ -16,6 +16,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	core "github.com/openclaw/crabbox/internal/cli"
 )
 
 type api interface {
@@ -122,7 +124,7 @@ func upstashBoxCleanupContext() (context.Context, context.CancelFunc) {
 }
 
 func defaultUpstashBoxHTTPClient() *http.Client {
-	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport := core.CloneDefaultTransport()
 	transport.ResponseHeaderTimeout = upstashBoxDefaultResponseHeaderTimeout
 	return &http.Client{Transport: transport}
 }

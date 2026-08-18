@@ -147,7 +147,7 @@ func scalewayAPIURL(profile *scw.Profile) string {
 func defaultScalewayHTTPClient() *http.Client {
 	return &http.Client{
 		Timeout:   30 * time.Second,
-		Transport: http.DefaultTransport.(*http.Transport).Clone(),
+		Transport: core.CloneDefaultTransport(),
 	}
 }
 

@@ -7,6 +7,15 @@ import (
 	"strings"
 )
 
+// CloneDefaultTransport copies http.DefaultTransport when it is a *http.Transport.
+// A replaced non-transport RoundTripper falls back to a new Transport.
+func CloneDefaultTransport() *http.Transport {
+	if transport, ok := http.DefaultTransport.(*http.Transport); ok {
+		return transport.Clone()
+	}
+	return &http.Transport{}
+}
+
 // redirectCheckedHTTPClient clones source so callers can constrain redirects
 // without mutating a shared client or discarding its transport and timeouts.
 func redirectCheckedHTTPClient(source *http.Client, check func(*http.Request) error) *http.Client {
