@@ -2,18 +2,36 @@ package cli
 
 import (
 	"errors"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 )
 
 // CloneDefaultTransport copies http.DefaultTransport when it is a *http.Transport.
-// A replaced non-transport RoundTripper falls back to a new Transport.
+// A replaced non-transport RoundTripper falls back to standard Transport defaults,
+// including environment proxy lookup.
 func CloneDefaultTransport() *http.Transport {
 	if transport, ok := http.DefaultTransport.(*http.Transport); ok {
 		return transport.Clone()
 	}
-	return &http.Transport{}
+	return newStandardHTTPTransport()
+}
+
+func newStandardHTTPTransport() *http.Transport {
+	return &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
 }
 
 // redirectCheckedHTTPClient clones source so callers can constrain redirects
