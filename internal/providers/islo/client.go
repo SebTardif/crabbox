@@ -68,7 +68,11 @@ var newIsloClient = func(cfg Config, rt Runtime) (isloAPI, error) {
 	baseURL := strings.TrimRight(blank(cfg.Islo.BaseURL, "https://api.islo.dev"), "/")
 	httpClient := rt.HTTP
 	if httpClient == nil {
-		httpClient = defaultIsloHTTPClient()
+		var err error
+		httpClient, err = defaultIsloHTTPClient()
+		if err != nil {
+			return nil, fmt.Errorf("%s HTTP client setup: %w", isloProvider, err)
+		}
 	}
 	httpClient, err := isloHTTPClientWithRedirectGuard(baseURL, httpClient)
 	if err != nil {
@@ -94,10 +98,13 @@ func isloCleanupContext() (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), isloCleanupTimeout)
 }
 
-func defaultIsloHTTPClient() *http.Client {
-	transport := core.CloneDefaultTransport()
+func defaultIsloHTTPClient() (*http.Client, error) {
+	transport, err := core.CloneDefaultTransport()
+	if err != nil {
+		return nil, err
+	}
 	transport.ResponseHeaderTimeout = isloDefaultResponseHeaderTimeout
-	return &http.Client{Transport: transport}
+	return &http.Client{Transport: transport}, nil
 }
 
 func isloHTTPClientWithRedirectGuard(baseURL string, source *http.Client) (*http.Client, error) {

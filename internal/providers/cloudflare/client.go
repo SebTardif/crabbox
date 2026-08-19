@@ -103,7 +103,10 @@ func newCloudflareClient(cfg Config, rt Runtime) (*cloudflareClient, error) {
 	baseURL := strings.TrimRight(parsed.String(), "/")
 	httpClient := rt.HTTP
 	if httpClient == nil {
-		httpClient = defaultCloudflareHTTPClient()
+		httpClient, err = defaultCloudflareHTTPClient()
+		if err != nil {
+			return nil, fmt.Errorf("%s HTTP client setup: %w", providerName, err)
+		}
 	}
 	return &cloudflareClient{
 		baseURL:      baseURL,
@@ -123,10 +126,13 @@ func cloudflareCleanupContext() (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), cloudflareCleanupTimeout)
 }
 
-func defaultCloudflareHTTPClient() *http.Client {
-	transport := core.CloneDefaultTransport()
+func defaultCloudflareHTTPClient() (*http.Client, error) {
+	transport, err := core.CloneDefaultTransport()
+	if err != nil {
+		return nil, err
+	}
 	transport.ResponseHeaderTimeout = cloudflareDefaultResponseHeaderTimeout
-	return &http.Client{Transport: transport}
+	return &http.Client{Transport: transport}, nil
 }
 
 func secureCloudflareHTTPClient(source *http.Client, baseURL string) *http.Client {

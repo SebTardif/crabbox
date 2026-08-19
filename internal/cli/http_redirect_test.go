@@ -1,120 +1,101 @@
 package cli
 
 import (
-	"fmt"
-	"io"
+	"crypto/tls"
+	"errors"
 	"net/http"
-	"net/http/httptest"
-	"os"
-	"os/exec"
-	"strings"
 	"testing"
+	"time"
 )
 
-type unusedDefaultRoundTripper struct{}
-
-func (unusedDefaultRoundTripper) RoundTrip(*http.Request) (*http.Response, error) {
-	return nil, fmt.Errorf("unused default transport")
+type recordingDefaultRoundTripper struct {
+	calls int
 }
 
-func TestCloneDefaultTransportAcceptsNonTransportDefault(t *testing.T) {
-	original := http.DefaultTransport
-	t.Cleanup(func() {
-		http.DefaultTransport = original
-	})
-	http.DefaultTransport = unusedDefaultRoundTripper{}
+func (r *recordingDefaultRoundTripper) RoundTrip(*http.Request) (*http.Response, error) {
+	r.calls++
+	return nil, errors.New("deny all")
+}
 
-	transport := CloneDefaultTransport()
-	if transport == nil {
-		t.Fatal("cloned transport is nil")
+func TestCloneDefaultTransportRejectsUnsupportedDefaults(t *testing.T) {
+	recorder := &recordingDefaultRoundTripper{}
+	var typedNil *http.Transport
+	tests := []struct {
+		name      string
+		transport http.RoundTripper
+	}{
+		{name: "recording wrapper", transport: recorder},
+		{name: "nil", transport: nil},
+		{name: "typed nil transport", transport: typedNil},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			original := http.DefaultTransport
+			t.Cleanup(func() { http.DefaultTransport = original })
+			http.DefaultTransport = tc.transport
+
+			transport, err := CloneDefaultTransport()
+			if transport != nil {
+				t.Fatalf("transport=%#v, want nil", transport)
+			}
+			if err == nil || err.Error() != cloneDefaultTransportError {
+				t.Fatalf("error=%v, want %q", err, cloneDefaultTransportError)
+			}
+		})
+	}
+	if recorder.calls != 0 {
+		t.Fatalf("recording default invoked %d times, want 0", recorder.calls)
 	}
 }
 
-func TestCloneDefaultTransportCopiesRealDefaultTransport(t *testing.T) {
-	original, ok := http.DefaultTransport.(*http.Transport)
-	if !ok {
-		t.Skip("http.DefaultTransport is not *http.Transport")
-	}
+func TestCloneDefaultTransportPreservesSettingsAndIsolatesMutableState(t *testing.T) {
+	originalDefault := http.DefaultTransport
+	t.Cleanup(func() { http.DefaultTransport = originalDefault })
 
-	cloned := CloneDefaultTransport()
-	if cloned == nil {
-		t.Fatal("cloned transport is nil")
+	original := &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          37,
+		ResponseHeaderTimeout: 19 * time.Second,
+		TLSClientConfig:       &tls.Config{MinVersion: tls.VersionTLS12},
+		ProxyConnectHeader:    http.Header{"X-Trace": {"preserved"}},
+		TLSNextProto: map[string]func(string, *tls.Conn) http.RoundTripper{
+			"custom": nil,
+		},
+	}
+	http.DefaultTransport = original
+
+	cloned, err := CloneDefaultTransport()
+	if err != nil {
+		t.Fatal(err)
 	}
 	if cloned == original {
 		t.Fatal("clone reused http.DefaultTransport")
 	}
-}
-
-func TestCloneDefaultTransportFallbackRoutesThroughProxy(t *testing.T) {
-	if os.Getenv("CRABBOX_CLONE_TRANSPORT_PROXY_CHILD") == "1" {
-		runCloneDefaultTransportProxyChild(t)
-		return
+	if cloned.Proxy == nil || !cloned.ForceAttemptHTTP2 || cloned.MaxIdleConns != 37 || cloned.ResponseHeaderTimeout != 19*time.Second {
+		t.Fatalf("clone lost transport settings: %#v", cloned)
+	}
+	if cloned.TLSClientConfig == nil || cloned.TLSClientConfig.MinVersion != tls.VersionTLS12 {
+		t.Fatalf("clone lost TLS settings: %#v", cloned.TLSClientConfig)
+	}
+	if cloned.ProxyConnectHeader.Get("X-Trace") != "preserved" {
+		t.Fatalf("clone lost proxy headers: %#v", cloned.ProxyConnectHeader)
+	}
+	if _, ok := cloned.TLSNextProto["custom"]; !ok {
+		t.Fatalf("clone lost TLSNextProto: %#v", cloned.TLSNextProto)
 	}
 
-	proxied := 0
-	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		proxied++
-		if r.Method != http.MethodGet || r.URL.Host == "" {
-			t.Errorf("proxy request method=%s host=%q", r.Method, r.URL.Host)
-		}
-		w.WriteHeader(http.StatusOK)
-		_, _ = io.WriteString(w, "proxied")
-	}))
-	t.Cleanup(proxy.Close)
-
-	cmd := exec.Command(os.Args[0], "-test.run=^TestCloneDefaultTransportFallbackRoutesThroughProxy$", "-test.count=1")
-	cmd.Env = cloneTransportProxyChildEnv(proxy.URL)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("child process: %v\n%s", err, out)
+	cloned.TLSClientConfig.MinVersion = tls.VersionTLS13
+	cloned.ProxyConnectHeader.Set("X-Trace", "changed")
+	delete(cloned.TLSNextProto, "custom")
+	if original.TLSClientConfig.MinVersion != tls.VersionTLS12 {
+		t.Fatal("clone shared TLSClientConfig with default transport")
 	}
-	if proxied == 0 {
-		t.Fatalf("parent proxy received no request\n%s", out)
+	if original.ProxyConnectHeader.Get("X-Trace") != "preserved" {
+		t.Fatal("clone shared ProxyConnectHeader with default transport")
 	}
-}
-
-func runCloneDefaultTransportProxyChild(t *testing.T) {
-	http.DefaultTransport = unusedDefaultRoundTripper{}
-	transport := CloneDefaultTransport()
-	if transport.Proxy == nil {
-		t.Fatal("fallback Proxy is nil, want ProxyFromEnvironment")
+	if _, ok := original.TLSNextProto["custom"]; !ok {
+		t.Fatal("clone shared TLSNextProto with default transport")
 	}
-	client := &http.Client{Transport: transport}
-	resp, err := client.Get("http://example.invalid/fallback")
-	if err != nil {
-		t.Fatalf("fallback request: %v", err)
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(body) != "proxied" {
-		t.Fatalf("body=%q, want proxied", body)
-	}
-}
-
-func cloneTransportProxyChildEnv(proxyURL string) []string {
-	skip := map[string]bool{
-		"HTTP_PROXY": true, "HTTPS_PROXY": true, "NO_PROXY": true, "ALL_PROXY": true,
-		"http_proxy": true, "https_proxy": true, "no_proxy": true, "all_proxy": true,
-	}
-	env := make([]string, 0, 16)
-	for _, item := range os.Environ() {
-		key, _, _ := strings.Cut(item, "=")
-		if skip[key] {
-			continue
-		}
-		env = append(env, item)
-	}
-	return append(env,
-		"CRABBOX_CLONE_TRANSPORT_PROXY_CHILD=1",
-		"HTTP_PROXY="+proxyURL,
-		"HTTPS_PROXY="+proxyURL,
-		"NO_PROXY=",
-		"ALL_PROXY=",
-		"http_proxy="+proxyURL,
-		"https_proxy="+proxyURL,
-		"no_proxy=",
-	)
 }
