@@ -5,7 +5,9 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
+	"os"
+	"os/exec"
+	"strings"
 	"testing"
 )
 
@@ -44,6 +46,11 @@ func TestCloneDefaultTransportCopiesRealDefaultTransport(t *testing.T) {
 }
 
 func TestCloneDefaultTransportFallbackRoutesThroughProxy(t *testing.T) {
+	if os.Getenv("CRABBOX_CLONE_TRANSPORT_PROXY_CHILD") == "1" {
+		runCloneDefaultTransportProxyChild(t)
+		return
+	}
+
 	proxied := 0
 	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		proxied++
@@ -55,32 +62,59 @@ func TestCloneDefaultTransportFallbackRoutesThroughProxy(t *testing.T) {
 	}))
 	t.Cleanup(proxy.Close)
 
-	original := http.DefaultTransport
-	t.Cleanup(func() {
-		http.DefaultTransport = original
-	})
-	http.DefaultTransport = unusedDefaultRoundTripper{}
+	cmd := exec.Command(os.Args[0], "-test.run=^TestCloneDefaultTransportFallbackRoutesThroughProxy$", "-test.count=1")
+	cmd.Env = cloneTransportProxyChildEnv(proxy.URL)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("child process: %v\n%s", err, out)
+	}
+	if proxied == 0 {
+		t.Fatalf("parent proxy received no request\n%s", out)
+	}
+}
 
+func runCloneDefaultTransportProxyChild(t *testing.T) {
+	http.DefaultTransport = unusedDefaultRoundTripper{}
 	transport := CloneDefaultTransport()
 	if transport.Proxy == nil {
-		t.Fatal("fallback Proxy is nil, want environment proxy lookup")
+		t.Fatal("fallback Proxy is nil, want ProxyFromEnvironment")
 	}
-	// ProxyFromEnvironment caches process env on first use, so a later
-	// t.Setenv(HTTP_PROXY) is ignored in the full package suite. Prove the
-	// returned transport can still send through a local proxy.
-	proxyURL, err := url.Parse(proxy.URL)
-	if err != nil {
-		t.Fatal(err)
-	}
-	transport.Proxy = http.ProxyURL(proxyURL)
-
 	client := &http.Client{Transport: transport}
 	resp, err := client.Get("http://example.invalid/fallback")
 	if err != nil {
 		t.Fatalf("fallback request: %v", err)
 	}
 	defer resp.Body.Close()
-	if proxied == 0 {
-		t.Fatal("fallback transport did not send the request through the local proxy")
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
 	}
+	if string(body) != "proxied" {
+		t.Fatalf("body=%q, want proxied", body)
+	}
+}
+
+func cloneTransportProxyChildEnv(proxyURL string) []string {
+	skip := map[string]bool{
+		"HTTP_PROXY": true, "HTTPS_PROXY": true, "NO_PROXY": true, "ALL_PROXY": true,
+		"http_proxy": true, "https_proxy": true, "no_proxy": true, "all_proxy": true,
+	}
+	env := make([]string, 0, 16)
+	for _, item := range os.Environ() {
+		key, _, _ := strings.Cut(item, "=")
+		if skip[key] {
+			continue
+		}
+		env = append(env, item)
+	}
+	return append(env,
+		"CRABBOX_CLONE_TRANSPORT_PROXY_CHILD=1",
+		"HTTP_PROXY="+proxyURL,
+		"HTTPS_PROXY="+proxyURL,
+		"NO_PROXY=",
+		"ALL_PROXY=",
+		"http_proxy="+proxyURL,
+		"https_proxy="+proxyURL,
+		"no_proxy=",
+	)
 }
