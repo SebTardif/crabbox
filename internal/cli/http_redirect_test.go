@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
 )
 
@@ -59,18 +60,27 @@ func TestCloneDefaultTransportFallbackRoutesThroughProxy(t *testing.T) {
 		http.DefaultTransport = original
 	})
 	http.DefaultTransport = unusedDefaultRoundTripper{}
-	t.Setenv("HTTP_PROXY", proxy.URL)
-	t.Setenv("HTTPS_PROXY", proxy.URL)
-	t.Setenv("NO_PROXY", "")
-	t.Setenv("ALL_PROXY", "")
 
-	client := &http.Client{Transport: CloneDefaultTransport()}
+	transport := CloneDefaultTransport()
+	if transport.Proxy == nil {
+		t.Fatal("fallback Proxy is nil, want environment proxy lookup")
+	}
+	// ProxyFromEnvironment caches process env on first use, so a later
+	// t.Setenv(HTTP_PROXY) is ignored in the full package suite. Prove the
+	// returned transport can still send through a local proxy.
+	proxyURL, err := url.Parse(proxy.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transport.Proxy = http.ProxyURL(proxyURL)
+
+	client := &http.Client{Transport: transport}
 	resp, err := client.Get("http://example.invalid/fallback")
 	if err != nil {
 		t.Fatalf("fallback request: %v", err)
 	}
 	defer resp.Body.Close()
 	if proxied == 0 {
-		t.Fatal("fallback transport did not send the request through HTTP_PROXY")
+		t.Fatal("fallback transport did not send the request through the local proxy")
 	}
 }
