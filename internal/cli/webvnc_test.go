@@ -412,6 +412,25 @@ func TestSameWebVNCOrigin(t *testing.T) {
 	}
 }
 
+func TestWebVNCWebSocketDialOptionsBoundsResponseHeaders(t *testing.T) {
+	options := webVNCWebSocketDialOptions(http.Header{
+		"X-Crabbox-Bridge-Ticket": {"bridge-ticket"},
+	})
+	if options == nil || options.HTTPClient == nil {
+		t.Fatal("dial options missing HTTP client")
+	}
+	if options.HTTPClient.Timeout != 0 {
+		t.Fatalf("client timeout=%s, want 0 so the upgraded websocket is not killed", options.HTTPClient.Timeout)
+	}
+	transport, ok := options.HTTPClient.Transport.(*http.Transport)
+	if !ok || transport == nil {
+		t.Fatalf("transport=%T, want *http.Transport", options.HTTPClient.Transport)
+	}
+	if transport.ResponseHeaderTimeout != 30*time.Second {
+		t.Fatalf("response header timeout=%s, want 30s", transport.ResponseHeaderTimeout)
+	}
+}
+
 func TestWebVNCWebSocketDialRejectsCrossOriginDowngradeRedirect(t *testing.T) {
 	redirected := make(chan http.Header, 1)
 	sink := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

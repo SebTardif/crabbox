@@ -2913,8 +2913,14 @@ func normalizedWebVNCOrigin(value string) (scheme, host, port string, ok bool) {
 }
 
 func webVNCWebSocketDialOptions(headers http.Header) *websocket.DialOptions {
+	transport, err := CloneDefaultTransport()
+	if err != nil {
+		transport = &http.Transport{Proxy: http.ProxyFromEnvironment}
+	}
+	transport.ResponseHeaderTimeout = 30 * time.Second
 	return &websocket.DialOptions{
 		HTTPClient: &http.Client{
+			Transport: transport,
 			CheckRedirect: func(*http.Request, []*http.Request) error {
 				return http.ErrUseLastResponse
 			},
