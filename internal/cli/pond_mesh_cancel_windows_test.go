@@ -295,7 +295,7 @@ func waitForPondMeshWindowsChildPID(t *testing.T, path string) int {
 			}
 			return pid
 		}
-		// A published file can still have a transient Windows sharing lock.
+		// Windows can expose the renamed path before releasing its sharing lock.
 		if !errors.Is(err, os.ErrNotExist) && !errors.Is(err, windows.ERROR_SHARING_VIOLATION) {
 			t.Fatal(err)
 		}
