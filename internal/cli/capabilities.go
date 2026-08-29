@@ -401,10 +401,13 @@ if (-not $result.TcpTestSucceeded) { exit 1 }`)
 const vncPasswordSSHWait = 30 * time.Second
 
 func runVNCPasswordSSH(ctx context.Context, target SSHTarget, remote string) (string, error) {
-	return runSSHOutputWithRemoteWaitTimeout(ctx, target, remote, vncPasswordSSHWait, "2", "1")
+	ctx, cancel := context.WithTimeout(ctx, vncPasswordSSHWait)
+	defer cancel()
+	return runSSHOutputWithRemoteWaitTimeout(ctx, target, remote, vncPasswordSSHWait, "10", "3")
 }
 
-func vncPasswordCommand(target SSHTarget) string {
+// remoteVNCCredentialReadCommand builds a remote read operation, not a credential value.
+func remoteVNCCredentialReadCommand(target SSHTarget) string {
 	if isWindowsNativeTarget(target) {
 		return powershellCommand("Get-Content -Raw -LiteralPath " + psQuote(windowsVNCPasswordPath))
 	}

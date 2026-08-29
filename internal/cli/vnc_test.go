@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -537,19 +538,93 @@ func TestVNCLoopbackCheckCommandSupportsWindows(t *testing.T) {
 	}
 }
 
-func TestVNCPasswordCommandSupportsManagedTargets(t *testing.T) {
-	windows := vncPasswordCommand(SSHTarget{TargetOS: targetWindows, WindowsMode: windowsModeNormal})
+func TestRemoteVNCCredentialReadCommandSupportsManagedTargets(t *testing.T) {
+	windows := remoteVNCCredentialReadCommand(SSHTarget{TargetOS: targetWindows, WindowsMode: windowsModeNormal})
 	if !strings.Contains(windows, "EncodedCommand") {
 		t.Fatalf("windows password command should be encoded PowerShell: %q", windows)
 	}
-	if got := vncPasswordCommand(SSHTarget{TargetOS: targetMacOS}); got != "sudo cat '/var/db/crabbox/vnc.password'" {
+	if got := decodePowerShellCommand(t, windows); !strings.HasSuffix(got, "\nGet-Content -Raw -LiteralPath "+psQuote(windowsVNCPasswordPath)) {
+		t.Fatalf("windows credential read command=%q", got)
+	}
+	if got := remoteVNCCredentialReadCommand(SSHTarget{TargetOS: targetMacOS}); got != "sudo cat '/var/db/crabbox/vnc.password'" {
 		t.Fatalf("mac password command=%q", got)
+	}
+	if got := remoteVNCCredentialReadCommand(SSHTarget{}); got != "cat "+shellQuote(vncPasswordPath) {
+		t.Fatalf("linux credential read command=%q", got)
 	}
 }
 
 func TestVNCPasswordSSHWaitIsBounded(t *testing.T) {
 	if vncPasswordSSHWait != 30*time.Second {
 		t.Fatalf("vncPasswordSSHWait=%s, want 30s", vncPasswordSSHWait)
+	}
+}
+
+func TestVNCPasswordSSHExecutesAndCancelsNativeReads(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX executable SSH fixture; native WSL behavior has separate coverage")
+	}
+	dir := t.TempDir()
+	script := `#!/bin/sh
+printf '%s\n' "$@" > "$VNC_FIXTURE_ARGS"
+if [ "$VNC_FIXTURE_STALL" = 1 ]; then exec sleep 120; fi
+printf '  fixture-vnc-value\n'
+`
+	if err := os.WriteFile(filepath.Join(dir, "ssh"), []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	for _, osName := range []string{targetLinux, targetMacOS, targetWindows} {
+		t.Run(osName, func(t *testing.T) {
+			argsPath := filepath.Join(t.TempDir(), "args")
+			target := SSHTarget{Host: "fixture.invalid", User: "tester", Port: "22", TargetOS: osName, WindowsMode: windowsModeNormal, NoControlMaster: true, ChildEnv: map[string]string{"VNC_FIXTURE_ARGS": argsPath}}
+			out, err := runVNCPasswordSSH(t.Context(), target, remoteVNCCredentialReadCommand(target))
+			if err != nil || out != "fixture-vnc-value" {
+				t.Fatalf("credential read failed: err=%v matched=%t", err, out == "fixture-vnc-value")
+			}
+			args := readSSHArgsRecorder(t, argsPath)
+			assertSSHOption(t, args, "ConnectTimeout", "10")
+			assertSSHOption(t, args, "ConnectionAttempts", "3")
+			target.ChildEnv["VNC_FIXTURE_STALL"] = "1"
+			ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+			defer cancel()
+			start := time.Now()
+			out, err = runVNCPasswordSSH(ctx, target, remoteVNCCredentialReadCommand(target))
+			if err == nil || out != "" || ctx.Err() != context.DeadlineExceeded || time.Since(start) > 5*time.Second {
+				t.Fatalf("caller cancellation lost: err=%v empty=%t elapsed=%s", err, out == "", time.Since(start))
+			}
+		})
+	}
+	t.Run("production deadline", func(t *testing.T) {
+		target := SSHTarget{Host: "fixture.invalid", User: "tester", Port: "22", TargetOS: targetLinux, NoControlMaster: true, ChildEnv: map[string]string{"VNC_FIXTURE_ARGS": filepath.Join(t.TempDir(), "args"), "VNC_FIXTURE_STALL": "1"}}
+		ctx, cancel := context.WithTimeout(t.Context(), 45*time.Second)
+		defer cancel()
+		start := time.Now()
+		out, err := runVNCPasswordSSH(ctx, target, remoteVNCCredentialReadCommand(target))
+		if err == nil || out != "" || ctx.Err() != nil || time.Since(start) < 29*time.Second {
+			t.Fatalf("read deadline lost: err=%v empty=%t caller=%v elapsed=%s", err, out == "", ctx.Err(), time.Since(start))
+		}
+		t.Logf("stalled SSH process reaped after %s with caller deadline still live", time.Since(start))
+	})
+}
+
+func TestVNCPasswordSSHBoundsWSLStageContext(t *testing.T) {
+	witness := errors.New("fixture stopped before remote staging")
+	oldStage := stageWSLSpool
+	t.Cleanup(func() { stageWSLSpool = oldStage })
+	called := false
+	stageWSLSpool = func(_ *wslStageSpool, ctx context.Context, _ *SSHTarget, timing wslStageTiming, connectTimeout, attempts string, _ io.Writer) (string, error) {
+		called = true
+		deadline, ok := ctx.Deadline()
+		if !ok || time.Until(deadline) <= 0 || time.Until(deadline) > vncPasswordSSHWait || timing.operation != vncPasswordSSHWait || connectTimeout != "10" || attempts != "3" {
+			t.Errorf("WSL read lost finite caller/operation budget or connection defaults")
+		}
+		return "", witness
+	}
+	target := SSHTarget{Host: "fixture.invalid", User: "tester", Port: "22", TargetOS: targetWindows, WindowsMode: windowsModeWSL2}
+	out, err := runVNCPasswordSSH(t.Context(), target, remoteVNCCredentialReadCommand(target))
+	if !called || !errors.Is(err, witness) || out != "" {
+		t.Fatalf("stage boundary called=%t err=%v empty=%t", called, err, out == "")
 	}
 }
 

@@ -8,6 +8,11 @@ normal command output. For a static SSH host it describes an existing
 host-managed VNC service instead of pretending the host is a Crabbox-created
 box.
 
+VNC and WebVNC credential reads share a 30-second operation deadline, including
+SSH preparation and connection attempts. An earlier caller deadline still wins.
+Cancellation retains the transport's bounded process and remote cleanup, so
+cleanup can add a short delay before the command returns.
+
 Use it when you want to view or manually drive the visible desktop inside a
 lease:
 
