@@ -547,6 +547,12 @@ func TestVNCPasswordCommandSupportsManagedTargets(t *testing.T) {
 	}
 }
 
+func TestVNCPasswordSSHWaitIsBounded(t *testing.T) {
+	if vncPasswordSSHWait != 30*time.Second {
+		t.Fatalf("vncPasswordSSHWait=%s, want 30s", vncPasswordSSHWait)
+	}
+}
+
 func TestWindowsBrowserProbeScriptIsRawPowerShell(t *testing.T) {
 	got := windowsBrowserProbeScript()
 	for _, want := range []string{

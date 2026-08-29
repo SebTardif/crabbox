@@ -398,6 +398,12 @@ if (-not $result.TcpTestSucceeded) { exit 1 }`)
 	return "ss -ltn | grep -q '127.0.0.1:5900'"
 }
 
+const vncPasswordSSHWait = 30 * time.Second
+
+func runVNCPasswordSSH(ctx context.Context, target SSHTarget, remote string) (string, error) {
+	return runSSHOutputWithRemoteWaitTimeout(ctx, target, remote, vncPasswordSSHWait, "2", "1")
+}
+
 func vncPasswordCommand(target SSHTarget) string {
 	if isWindowsNativeTarget(target) {
 		return powershellCommand("Get-Content -Raw -LiteralPath " + psQuote(windowsVNCPasswordPath))
