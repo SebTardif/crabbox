@@ -2842,7 +2842,12 @@ func connectWebVNCBridgeWithDial(ctx context.Context, coord *CoordinatorClient, 
 		}
 	}
 	agentURL := webVNCAgentURLWithCapabilities(agentBaseURL, leaseID, capabilities)
-	ws, resp, err := websocket.Dial(ctx, agentURL, webVNCWebSocketDialOptions(headers))
+	options, err := webVNCWebSocketDialOptions(headers)
+	if err != nil {
+		_ = tcp.Close()
+		return nil, err
+	}
+	ws, resp, err := websocket.Dial(ctx, agentURL, options)
 	if retryBridgeTicketInAuthorization(resp, err) {
 		var retryHeaders http.Header
 		if splitAgentOrigin {
@@ -2850,7 +2855,8 @@ func connectWebVNCBridgeWithDial(ctx context.Context, coord *CoordinatorClient, 
 		} else {
 			retryHeaders = bridgeTicketHeaders(coord, ticket.Ticket)
 		}
-		ws, _, err = websocket.Dial(ctx, agentURL, webVNCWebSocketDialOptions(retryHeaders))
+		options.HTTPHeader = retryHeaders
+		ws, _, err = websocket.Dial(ctx, agentURL, options)
 	}
 	if err != nil {
 		_ = tcp.Close()
@@ -2912,10 +2918,10 @@ func normalizedWebVNCOrigin(value string) (scheme, host, port string, ok bool) {
 	return scheme, host, port, true
 }
 
-func webVNCWebSocketDialOptions(headers http.Header) *websocket.DialOptions {
+func webVNCWebSocketDialOptions(headers http.Header) (*websocket.DialOptions, error) {
 	transport, err := CloneDefaultTransport()
 	if err != nil {
-		transport = &http.Transport{Proxy: http.ProxyFromEnvironment}
+		return nil, err
 	}
 	transport.ResponseHeaderTimeout = 30 * time.Second
 	return &websocket.DialOptions{
@@ -2926,7 +2932,7 @@ func webVNCWebSocketDialOptions(headers http.Header) *websocket.DialOptions {
 			},
 		},
 		HTTPHeader: headers,
-	}
+	}, nil
 }
 
 func webVNCAgentBaseURL(base string) (string, error) {
@@ -3189,7 +3195,7 @@ func resolveWebVNCPortalCredentials(
 	if target.TargetOS == targetMacOS {
 		return resolveMacOSWebVNCCredentials(ctx, cfg, target, readPassword)
 	}
-	password, _ := readPassword(ctx, target, vncPasswordCommand(target))
+	password, _ := readPassword(ctx, target, remoteVNCCredentialReadCommand(target))
 	return rfbCredentials{Password: strings.TrimSpace(password)}, localWebVNCAuthAuto, nil
 }
 
@@ -3357,7 +3363,7 @@ func (a App) directSSHWebVNC(ctx context.Context, cfg Config, id, localPort stri
 	if err := verifyVNCForegroundTunnelListener(tunnel, tunnelPort); err != nil {
 		return exit(5, "verify direct SSH WebVNC tunnel before credential retrieval: %v", err)
 	}
-	passwordOutput, passwordErr := runSSHOutput(ctx, target, vncPasswordCommand(target))
+	passwordOutput, passwordErr := runSSHOutput(ctx, target, remoteVNCCredentialReadCommand(target))
 	password := strings.TrimSpace(passwordOutput)
 	if passwordErr != nil && !allowNone {
 		return exit(5, "read direct SSH WebVNC credential: %v", passwordErr)
@@ -3423,7 +3429,7 @@ func (a App) directSSHWindowsWebVNC(
 		case <-bridgeCtx.Done():
 		}
 	}()
-	password, err := runSSHOutput(ctx, target, vncPasswordCommand(target))
+	password, err := runSSHOutput(ctx, target, remoteVNCCredentialReadCommand(target))
 	if err != nil {
 		return exit(5, "read native Windows VNC credential: %v", err)
 	}
@@ -3525,7 +3531,7 @@ func (a App) directSSHWebVNCStatus(ctx context.Context, cfg Config, id, localPor
 		authenticationErr = verifyDirectSSHWebVNCListenerOwner(localPort, expectedListenerOwnerPID)
 		if authenticationErr == nil {
 			var passwordErr error
-			password, passwordErr = runSSHOutput(ctx, target, vncPasswordCommand(target))
+			password, passwordErr = runSSHOutput(ctx, target, remoteVNCCredentialReadCommand(target))
 			password = strings.TrimSpace(password)
 			if passwordErr != nil && !allowNone {
 				authenticationErr = passwordErr
@@ -3797,7 +3803,7 @@ func vncTunnelCommandTo(target SSHTarget, localPort, remoteHost, remotePort stri
 func runDirectSSHWebVNCRemoteCombinedOutput(ctx context.Context, target SSHTarget, remote string) (string, error) {
 	if isWindowsWSL2Target(target) {
 		// Large lifecycle scripts exceed Windows' command-line limit when nested
-		// in PowerShell EncodedCommand. Stage them over SSH stdin instead.
+		// in PowerShell. Use the finite SFTP stage and bounded execution path.
 		return runWSL2ControlScriptCombinedOutput(ctx, target, remote, 0, "10", "3")
 	}
 	return runSSHCombinedOutput(ctx, target, remote)
@@ -3872,12 +3878,12 @@ while [ "$launch_attempt" -lt 32 ]; do
     echo "failed to create direct WebVNC process identity" >&2
     exit 1
   fi
-  nohup env CRABBOX_DIRECT_WEBVNC_PROCESS_NONCE="$process_nonce" websockify --web="$web_dir" "127.0.0.1:$remote_port" 127.0.0.1:5900 9>&- >"$log" 2>&1 &
+  nohup setsid env CRABBOX_DIRECT_WEBVNC_PROCESS_NONCE="$process_nonce" websockify --web="$web_dir" "127.0.0.1:$remote_port" 127.0.0.1:5900 9>&- >"$log" 2>&1 &
   candidate_pid=$!
   pid="$candidate_pid"
   started=""
   for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50; do
-    if [ -r "/proc/$pid/stat" ]; then
+    if [ -r "/proc/$pid/stat" ] && [ "$(ps -o pgid= -p "$pid" | tr -d ' ')" = "$pid" ]; then
       started="$(awk '{print $22}' "/proc/$pid/stat")"
       break
     fi
