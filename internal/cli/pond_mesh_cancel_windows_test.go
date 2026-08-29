@@ -282,7 +282,8 @@ func waitForPondMeshWindowsChildPID(t *testing.T, path string) int {
 			}
 			return pid
 		}
-		if !errors.Is(err, os.ErrNotExist) {
+		// Windows can expose the renamed path before releasing its sharing lock.
+		if !errors.Is(err, os.ErrNotExist) && !errors.Is(err, windows.ERROR_SHARING_VIOLATION) {
 			t.Fatal(err)
 		}
 		if time.Now().After(deadline) {
