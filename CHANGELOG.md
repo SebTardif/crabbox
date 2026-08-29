@@ -7,6 +7,8 @@
 - Added opt-in Machine0 native size selection context to live catalog discovery while preserving configured defaults and exact fixed-lease replay.
 - Added durable fixed-ID Incus leases and private container disk checkpoints that survive source deletion, with ownership-checked cleanup and fresh SSH identity before fork startup.
 
+- Added opt-in Linux SSH `--require-artifact-change` checks with bounded content snapshots, created/changed/unchanged/missing timing states, and collection of only accepted bytes.
+
 ### Fixed
 
 - Bounded VNC/WebVNC credential reads to 30 seconds and 64 KiB, discarding partial credentials on any failure while preserving connection defaults, caller cancellation, and transport cleanup. Thanks @SebTardif.
@@ -52,6 +54,8 @@
 - Reported bounded, secret-safe remote Git seed failure phases and categories across ordinary sync, local Actions hydration, and native Windows, while preserving file sync and Git coherence behavior. Thanks @coygeek.
 - Made Machine0 doctor check the same SSH-key prerequisites as new creation and reject missing legacy key pairs when no default is selected, without mutating keys or blocking existing fixed-lease replay. Thanks @coygeek.
 - Cleaned exact-owned interrupted Azure public-IP and NIC provisioning prefixes while restoring ordered SKU fallback and preserving immutable-identity cleanup fences. Thanks @excelsier and @vincentkoc.
+
+- Rendered failure recovery guidance after automatic cleanup, omitting lease commands only after confirmed release while preserving retained and uncertain cleanup recovery.
 
 ## 0.47.0 - 2026-08-28
 

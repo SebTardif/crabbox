@@ -378,6 +378,8 @@ func (a App) runCommandWithBenchmarkRecord(ctx context.Context, args []string, b
 	defaults := defaultConfig()
 	fs := newFlagSet("run", a.Stderr)
 	runFlags := registerRunFlags(fs, defaults, ordinaryLeaseCreateFlagRegistrationOptions())
+	var requiredArtifactChanges stringListFlag
+	fs.Var(&requiredArtifactChanges, "require-artifact-change", "require created or changed bytes at an exact relative file path after successful Linux SSH execution; identical rewrites fail; repeatable")
 	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
@@ -458,6 +460,7 @@ func (a App) runCommandWithBenchmarkRecord(ctx context.Context, args []string, b
 		return err
 	}
 	var cleanup leaseCleanupResult
+	var finalizeFailureDigest func()
 	var runFailure error
 	recorder := &runRecorder{}
 	var finalizeTerminalRun func()
@@ -470,6 +473,7 @@ func (a App) runCommandWithBenchmarkRecord(ctx context.Context, args []string, b
 		}
 	}()
 	var finalTimingReport *timingReport
+	var artifactChangeResults []ArtifactChangeResult
 	var timingRecordRepo Repo
 	var timingRecordCommand []string
 	var timingRecordColdRun *bool
@@ -479,6 +483,7 @@ func (a App) runCommandWithBenchmarkRecord(ctx context.Context, args []string, b
 			return
 		}
 		report := *finalTimingReport
+		report.ArtifactChanges = artifactChangeResults
 		cleanup.apply(&report)
 		if timingRecordEnabled {
 			recordColdRun := timingRecordColdRun
@@ -504,6 +509,12 @@ func (a App) runCommandWithBenchmarkRecord(ctx context.Context, args []string, b
 		}
 		if writeErr := writeTimingJSON(a.Stderr, report); writeErr != nil && err == nil {
 			err = writeErr
+		}
+	}()
+	// Cleanup runs first; the final timing JSON must still be the last line.
+	defer func() {
+		if finalizeFailureDigest != nil {
+			finalizeFailureDigest()
 		}
 	}()
 	command := fs.Args()
@@ -568,6 +579,11 @@ func (a App) runCommandWithBenchmarkRecord(ctx context.Context, args []string, b
 		return err
 	}
 	requiredArtifactGlobs = appendUniqueStrings(nil, requiredArtifactGlobs...)
+	if err := validateArtifactChangePaths(requiredArtifactChanges); err != nil {
+		return err
+	}
+	requiredArtifactChanges = appendUniqueStrings(nil, requiredArtifactChanges...)
+	artifactChangeResults = initialArtifactChanges(requiredArtifactChanges)
 	if err := validateRequiredRunArtifactGlobs(requiredArtifactGlobs); err != nil {
 		return err
 	}
@@ -578,6 +594,9 @@ func (a App) runCommandWithBenchmarkRecord(ctx context.Context, args []string, b
 	}
 	runArtifactGlobs := appendUniqueStrings(append([]string{}, expansion.ArtifactGlobs...), requiredArtifactGlobs...)
 	if *syncOnly {
+		if len(requiredArtifactChanges) > 0 {
+			return exit(2, "--require-artifact-change cannot be combined with --sync-only")
+		}
 		if len(expansion.ArtifactGlobs) > 0 {
 			return exit(2, "--artifact-glob cannot be combined with --sync-only")
 		}
@@ -718,6 +737,9 @@ func (a App) runCommandWithBenchmarkRecord(ctx context.Context, args []string, b
 		}
 	}
 	if *leaseIDFlag == "" {
+		if err := validateArtifactChangeTarget(SSHTarget{TargetOS: cfg.TargetOS}, requiredArtifactChanges); err != nil {
+			return err
+		}
 		if err := validateRunArtifactGlobTarget(SSHTarget{TargetOS: cfg.TargetOS, WindowsMode: cfg.WindowsMode}, expansion.ArtifactGlobs); err != nil {
 			return err
 		}
@@ -754,6 +776,9 @@ func (a App) runCommandWithBenchmarkRecord(ctx context.Context, args []string, b
 			return err
 		}
 		providerSpec := provider.Spec()
+		if len(requiredArtifactChanges) > 0 && providerSpec.Kind != ProviderKindSSHLease {
+			return exit(2, "--require-artifact-change requires an ordinary SSH-backed Linux provider")
+		}
 		if err := validateProviderRun(provider, runReq, *readyPool, len(requiredArtifactSchemas) > 0, expansion.Profile.Doctor.Enabled); err != nil {
 			return err
 		}
@@ -774,6 +799,9 @@ func (a App) runCommandWithBenchmarkRecord(ctx context.Context, args []string, b
 	backend, err := loadBackend(cfg, backendRuntime)
 	if err != nil {
 		return err
+	}
+	if len(requiredArtifactChanges) > 0 && backend.Spec().Kind != ProviderKindSSHLease {
+		return exit(2, "--require-artifact-change requires an ordinary SSH-backed Linux provider")
 	}
 	var server Server
 	var target SSHTarget
@@ -902,6 +930,9 @@ func (a App) runCommandWithBenchmarkRecord(ctx context.Context, args []string, b
 	if delegated, ok := backend.(DelegatedRunBackend); ok {
 		if err := validateDelegatedRunRouting(backend.Spec(), runReq, *readyPool, len(requiredArtifactSchemas) > 0, expansion.Profile.Doctor.Enabled); err != nil {
 			return err
+		}
+		if len(requiredArtifactChanges) > 0 {
+			return exit(2, "--require-artifact-change requires an ordinary SSH-backed Linux provider")
 		}
 		if !delegatedRoutePreflighted && delegatedRunNeedsLocalWorkspaceSync(backend.Spec(), runReq) {
 			if err := validateLocalWorkspaceSyncSource(repo); err != nil {
@@ -1152,6 +1183,9 @@ func (a App) runCommandWithBenchmarkRecord(ctx context.Context, args []string, b
 	if err := validateRequiredRunArtifactGlobTarget(target, requiredArtifactGlobs); err != nil {
 		return recordFailure(err)
 	}
+	if err := validateArtifactChangeTarget(target, requiredArtifactChanges); err != nil {
+		return recordFailure(err)
+	}
 	if expansion.Profile.Doctor.Enabled && isWindowsNativeTarget(target) {
 		return recordFailure(exit(2, "profile doctor is not supported for native Windows targets"))
 	}
@@ -1288,6 +1322,15 @@ func (a App) runCommandWithBenchmarkRecord(ctx context.Context, args []string, b
 	actionsEnvFile := ""
 	profileEnvFile := ""
 	actionsURL := ""
+	defer func() {
+		if len(requiredArtifactChanges) == 0 || finalTimingReport != nil || (!*timingJSON && !timingRecordEnabled) {
+			return
+		}
+		report := timingReportFromRunWithActionsURL(cfg.Provider, leaseID, serverSlug(server), timings, time.Since(timings.started), exitCodeForError(err, 7), actionsURL)
+		populateRunTimingMetadata(&report, cfg, repo, server, leaseID, executionRunID, workdir, nil)
+		report.Label = runLabelValue
+		finalTimingReport = &report
+	}()
 	hydratedByActions = false
 	autoHydrateActions := shouldAutoHydrateActions(cfg, *noHydrate, *noSync, freshPR, *syncOnly)
 	var preparedActionsHydration *localActionsHydrationPlan
@@ -2140,6 +2183,13 @@ afterSync:
 	}
 	leaseForEvidence := LeaseTarget{Server: server, SSH: target, LeaseID: leaseID, Coordinator: coord}
 	failureEvidenceCollector := beginRunFailureEvidence(ctx, sshBackend, leaseForEvidence, a.Stderr)
+	beforeArtifacts, err := snapshotArtifactChanges(ctx, target, workdir, requiredArtifactChanges)
+	if err != nil {
+		return recordFailure(err)
+	}
+	for i := range beforeArtifacts {
+		beforeArtifacts[i].data = nil
+	}
 	code, streamErr := runSSHStreamResult(ctx, target, remote, stdout, stderr)
 	failureEvidence := RunFailureEvidence{}
 	var results *TestResultSummary
@@ -2286,6 +2336,22 @@ afterSync:
 	}
 	var artifactFailure error
 	var schemaValidationResults []SchemaValidationResult
+	var afterArtifacts []artifactChangeSnapshot
+	if len(requiredArtifactChanges) > 0 && code == 0 && (streamErr != nil || ctx.Err() != nil) {
+		return recordFailure(errors.Join(streamErr, ctx.Err()))
+	}
+	if code == 0 && streamErr == nil && ctx.Err() == nil && len(requiredArtifactChanges) > 0 {
+		afterArtifacts, artifactFailure = snapshotArtifactChanges(ctx, target, workdir, requiredArtifactChanges)
+		if artifactFailure == nil {
+			artifactChangeResults, artifactFailure = compareArtifactChanges(requiredArtifactChanges, beforeArtifacts, afterArtifacts)
+		}
+		for _, result := range artifactChangeResults {
+			fmt.Fprintf(a.Stderr, "required artifact change path=%s status=%s\n", result.Path, result.Status)
+		}
+		if artifactFailure != nil {
+			code = 7
+		}
+	}
 	if code == 0 && len(requiredArtifactGlobs) > 0 {
 		requireOutput, err := requireRunArtifactGlobs(ctx, target, workdir, requiredArtifactGlobs)
 		if err != nil {
@@ -2317,7 +2383,17 @@ afterSync:
 		}
 	}
 	var runArtifacts []runArtifact
-	if code == 0 && len(runArtifactGlobs) > 0 {
+	if code == 0 && streamErr == nil && len(requiredArtifactChanges) > 0 {
+		collected, err := collectChangedArtifacts(repo.Root, executionRunID, leaseID, artifactChangeResults, afterArtifacts)
+		if err != nil {
+			return recordFailure(err)
+		}
+		runArtifacts = append(runArtifacts, collected...)
+		for _, artifact := range collected {
+			fmt.Fprintf(a.Stderr, "artifact kind=%s path=%s bytes=%d\n", artifact.Kind, artifact.Path, artifact.Bytes)
+		}
+	}
+	if code == 0 && len(requiredArtifactChanges) == 0 && len(runArtifactGlobs) > 0 {
 		collected, artifactOutput, err := collectRunArtifactGlobs(ctx, target, workdir, repo.Root, executionRunID, leaseID, runArtifactGlobs)
 		if err != nil {
 			return recordFailure(err)
@@ -2352,6 +2428,7 @@ afterSync:
 	populateRunTimingMetadata(&report, cfg, repo, server, leaseID, executionRunID, workdir, runArtifacts)
 	report.Label = runLabelValue
 	report.SchemaValidations = schemaValidationResults
+	report.ArtifactChanges = artifactChangeResults
 	if strings.TrimSpace(*emitProof) != "" && code == 0 {
 		template := cfg.ProofTemplates[strings.TrimSpace(*proofTemplate)]
 		proof, err := writeRunProof(strings.TrimSpace(*emitProof), strings.TrimSpace(*proofTemplate), proofRenderInput{
@@ -2410,7 +2487,7 @@ afterSync:
 		finalTimingReport = &report
 	}
 	if code != 0 {
-		printRunFailureDigest(a.Stderr, runFailureDigestInput{
+		digest := runFailureDigestInput{
 			Provider:              cfg.Provider,
 			TargetOS:              cfg.TargetOS,
 			WindowsMode:           cfg.WindowsMode,
@@ -2428,7 +2505,13 @@ afterSync:
 			Classification:        classification,
 			Phases:                timings.commandPhases,
 			Results:               results,
-		})
+		}
+		finalizeFailureDigest = func() {
+			digest.LeaseStopped = cleanup.Stopped
+			printRunFailureDigest(a.Stderr, digest)
+			printFailureTail(a.Stderr, "stdout", stdoutTail, *captureStdout)
+			printFailureTail(a.Stderr, "stderr", stderrTail, *captureStderr)
+		}
 		capture := FailureCaptureMetadata{
 			Provider:       cfg.Provider,
 			LeaseID:        leaseID,
@@ -2462,8 +2545,6 @@ afterSync:
 		}
 		hydrateSuggestion := rawJSRuntimeHydrateSuggestion(cfg, target, leaseID, acquired, *keep, *keepOnFailure)
 		printCommandNotFoundHint(a.Stderr, cfg, target, leaseID, command, *shellMode, code, hydratedByActions, hydrateSuggestion)
-		printFailureTail(a.Stderr, "stdout", stdoutTail, *captureStdout)
-		printFailureTail(a.Stderr, "stderr", stderrTail, *captureStderr)
 		if artifactFailure != nil {
 			return recordFailure(artifactFailure)
 		}
