@@ -12,6 +12,11 @@ VNC and WebVNC credential reads share a 30-second operation deadline, including
 SSH preparation and connection attempts. An earlier caller deadline still wins.
 Cancellation retains the transport's bounded process and remote cleanup, so
 cleanup can add a short delay before the command returns.
+Reads retain at most 64 KiB of raw stdout and discard stderr. An oversized read
+or any failure, including cleanup failure, returns no credential; partial
+passwords never reach a viewer or command output. This is a transport budget,
+not VNC's eight-byte DES key limit: longer macOS/ARD account passwords remain
+intact. Existing optional-credential and managed None-auth behavior is unchanged.
 
 Use it when you want to view or manually drive the visible desktop inside a
 lease:
