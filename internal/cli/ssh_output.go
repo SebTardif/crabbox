@@ -33,7 +33,8 @@ func runSSHOutputBoundedWithOptions(ctx context.Context, target SSHTarget, remot
 	// The transport owner finishes deferred cleanup before any output escapes.
 	if err := executeSSH(ctx, &target, remote, nil, 0, waitTimeout, connectTimeout, attempts, &out, io.Discard); err != nil {
 		if ctx.Err() != nil {
-			return "", ctx.Err()
+			// Cancellation must not hide failures reported by deferred cleanup.
+			return "", errors.Join(ctx.Err(), err)
 		}
 		return "", err
 	}

@@ -43,22 +43,41 @@ func TestRunSSHOutputBoundedDiscardsOutputOnDeferredCleanupFailure(t *testing.T)
 		{"credential owner", runVNCPasswordSSH},
 	} {
 		t.Run(read.name, func(t *testing.T) {
-			stageWSLSpool = func(spool *wslStageSpool, _ context.Context, _ *SSHTarget, _ wslStageTiming, _, _ string, _ io.Writer) (string, error) {
-				// The launcher needs only the staged digest. Closing the local file
-				// here makes its deferred Close fail after a successful command.
-				if err := spool.input.reader.Close(); err != nil {
-					t.Fatal(err)
-				}
-				spool.shell = wslStageCMD
-				return "0123456789abcdef0123456789abcdef", nil
-			}
-			target := SSHTarget{Host: "fixture.invalid", Port: "22", TargetOS: targetWindows, WindowsMode: windowsModeWSL2}
-			out, err := read.run(t.Context(), target, "unused")
-			if out != "" || !errors.Is(err, os.ErrClosed) {
-				t.Fatalf("cleanup failure lost: empty=%t err=%v", out == "", err)
-			}
-			if strings.Contains(err.Error(), "synthetic-private-output") {
-				t.Fatal("output exposed in cleanup error")
+			for _, scenario := range []struct {
+				name   string
+				cancel bool
+			}{
+				{name: "successful command"},
+				{name: "canceled command", cancel: true},
+			} {
+				t.Run(scenario.name, func(t *testing.T) {
+					ctx, cancel := context.WithCancel(t.Context())
+					defer cancel()
+					stageWSLSpool = func(spool *wslStageSpool, _ context.Context, _ *SSHTarget, _ wslStageTiming, _, _ string, _ io.Writer) (string, error) {
+						// The launcher needs only the staged digest. Closing the local file
+						// here makes its deferred Close fail after execution or cancellation.
+						if err := spool.input.reader.Close(); err != nil {
+							t.Fatal(err)
+						}
+						if scenario.cancel {
+							cancel()
+							return "", ctx.Err()
+						}
+						spool.shell = wslStageCMD
+						return "0123456789abcdef0123456789abcdef", nil
+					}
+					target := SSHTarget{Host: "fixture.invalid", Port: "22", TargetOS: targetWindows, WindowsMode: windowsModeWSL2}
+					out, err := read.run(ctx, target, "unused")
+					if out != "" || !errors.Is(err, os.ErrClosed) {
+						t.Fatalf("cleanup failure lost: empty=%t err=%v", out == "", err)
+					}
+					if strings.Contains(err.Error(), "synthetic-private-output") {
+						t.Fatal("output exposed in cleanup error")
+					}
+					if errors.Is(err, context.Canceled) != scenario.cancel {
+						t.Fatalf("caller cancellation lost: %v", err)
+					}
+				})
 			}
 		})
 	}
