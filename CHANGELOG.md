@@ -15,6 +15,9 @@
 
 ### Fixed
 
+- Honored cancellation during Code bridge reconnect and code-server readiness waits, preserving the existing retry delays while returning promptly on Ctrl+C. Thanks @SebTardif.
+- Bounded best-effort Testbox portal bookkeeping to one five-second budget and delayed final warmup completion/timing until it ends, preserving successful allocations and retained leases on sync failure.
+- Rejected lease-output aliases of captures and success/failure downloads before acquisition, preserving retained lease handles and existing output bytes.
 - Honored cancellation during Hostinger bootstrap SSH retry delays while preserving ownership-checked rollback and recovery state. Thanks @SebTardif.
 - Reaped WebVNC daemon SSH tunnels across child restarts and orderly shutdown, retaining exact ownership records and reporting failure when cleanup cannot be confirmed.
 - Bounded VNC/WebVNC credential reads to 30 seconds and 64 KiB, discarding partial credentials on any failure while preserving connection defaults, caller cancellation, and transport cleanup. Thanks @SebTardif.
@@ -23,6 +26,7 @@
 - Exposed resolved Incus settings in `config show --json`, with endpoint credential redaction and no daemon access.
 - Bounded coordinator lease reads, doctor probes, and HTTP heartbeats to 30 seconds, and stop's preliminary lookup to ten seconds, preserving provisioning budgets, provider-scoped release, caller cancellation, and cleanup evidence.
 - Retained scoped direct-AWS fixed-lease cleanup receipts for canonical stop replay after inventory disappears, with fresh account, region, identity, and inventory checks; older compact tombstones remain unchanged and fail closed.
+- Reported POSIX and WSL2 workspace-owner setup failures separately from SSH readiness, with bounded pre-start cleanup and fail-closed recovery when child observation is denied.
 - Attested fixed Machine0 checkpoint-fork replay from identity-checked VM details when inventory omits the pinned image version, preserving key semantics and refusing mismatches without duplicate creation.
 - Made native checkpoint source retirement replayable, preserving pending operation and image identity across interruption, fencing ordinary release after capture reservation, binding Machine0 retirement to its captured account, and refusing forks from discarded images without restarting a retiring Machine0 source or discarding unresolved ownership records; Hetzner retirement remains unavailable until its project identity can be attested.
 - Preserved explicit repository reclaim for existing Machine0 leases and unified fixed replay, inspection, and cleanup around attested native details and early durable UUID binding; retained ambiguous attempts and empty legacy records without duplicate creation or inferred cancellation.
