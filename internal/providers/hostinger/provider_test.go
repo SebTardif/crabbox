@@ -724,14 +724,19 @@ func TestEnsureBootstrapHonorsCancelDuringWait(t *testing.T) {
 	t.Cleanup(func() { hostingerRunSSHQuiet = oldRunSSHQuiet })
 
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	errCh := make(chan error, 1)
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		errCh <- backend.ensureBootstrap(ctx, core.Config{}, LeaseTarget{
 			LeaseID: "lease-wait",
 			Server:  core.Server{CloudID: "vm-wait"},
 		}, "bootstrap")
 	}()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
 
 	select {
 	case <-probed:
