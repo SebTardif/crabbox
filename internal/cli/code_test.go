@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -265,6 +267,70 @@ func TestStartCodeServerCommand(t *testing.T) {
 	}
 	if strings.Contains(got, "pkill -f") {
 		t.Fatalf("startCodeServerCommand should not use pkill -f:\n%s", got)
+	}
+}
+
+func TestEnsureRemoteCodeServerHonorsCancellationDuringBackoff(t *testing.T) {
+	// Prove cancel is observed during the ready-poll backoff, not only at
+	// the top of the loop. Start succeeds; health checks fail so wait sleeps.
+	if runtime.GOOS == "windows" {
+		t.Skip("shell ssh fixture")
+	}
+	dir := t.TempDir()
+	sshPath := filepath.Join(dir, "ssh")
+	probesPath := filepath.Join(dir, "probes")
+	script := `#!/bin/sh
+cmd=""
+for arg do cmd="$arg"; done
+case "$cmd" in
+  *healthz*)
+    printf 'probe\n' >> "$CRABBOX_FAKE_SSH_PROBES"
+    exit 255
+    ;;
+esac
+exit 0
+`
+	if err := os.WriteFile(sshPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("CRABBOX_FAKE_SSH_PROBES", probesPath)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- ensureRemoteCodeServer(ctx, SSHTarget{
+			User: "crabbox",
+			Host: "203.0.113.10",
+			Port: "22",
+		}, "/work/cbx/repo")
+	}()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if _, err := os.Stat(probesPath); err == nil {
+			break
+		}
+		select {
+		case err := <-errCh:
+			t.Fatalf("ensureRemoteCodeServer returned before backoff: %v", err)
+		case <-time.After(10 * time.Millisecond):
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("ensureRemoteCodeServer did not probe before backoff")
+		}
+	}
+	cancel()
+
+	// Ready-poll sleep is 500ms. A 3s bound would pass even on bare Sleep.
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("ensureRemoteCodeServer returned %v, want context.Canceled", err)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("ensureRemoteCodeServer did not return within 200ms after cancel; still blocked on bare sleep")
 	}
 }
 
