@@ -27,6 +27,16 @@ func testRuntimeWithRunner(r CommandRunner) Runtime {
 	return Runtime{Stdout: io.Discard, Stderr: io.Discard, Clock: realClock{}, Exec: r}
 }
 
+func TestRuntimeForAppSetsTimedHTTPClient(t *testing.T) {
+	rt := runtimeForApp(App{Stdout: io.Discard, Stderr: io.Discard})
+	if rt.HTTP == nil {
+		t.Fatal("runtimeForApp HTTP is nil")
+	}
+	if got, want := rt.HTTP.Timeout, 60*time.Second; got != want {
+		t.Fatalf("runtimeForApp HTTP Timeout = %v, want %v", got, want)
+	}
+}
+
 func TestLoadBackendRequiresActionableProviderSelection(t *testing.T) {
 	t.Setenv(controllerProviderScopeEnv, "")
 	t.Setenv("HCLOUD_TOKEN", "")
