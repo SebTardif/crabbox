@@ -298,24 +298,28 @@ func TestWorkspaceOwnerTokenAndTransportFailuresFailClosed(t *testing.T) {
 
 func TestWorkspaceOwnerAcquisitionBoundary(t *testing.T) {
 	nonExclusive := newWatchTestBackend()
-	if !shouldAcquireWorkspaceOwner(true, false, nonExclusive) {
+	if !shouldAcquireWorkspaceOwner(SSHTarget{}, true, false, nonExclusive) {
 		t.Fatal("a successful non-exclusive acquisition must acquire the workspace owner")
 	}
 	exclusive := runEnvProfileTestBackend{}
 	tests := []struct {
 		name      string
+		target    SSHTarget
 		acquired  bool
 		mayRetain bool
 		wantOwner bool
 	}{
-		{name: "fresh one-shot cleanup", acquired: true, wantOwner: false},
+		{name: "fresh Linux one-shot cleanup", target: SSHTarget{TargetOS: targetLinux}, acquired: true},
+		{name: "fresh macOS one-shot cleanup", target: SSHTarget{TargetOS: targetMacOS}, acquired: true},
+		{name: "fresh WSL2 one-shot cleanup", target: SSHTarget{TargetOS: targetWindows, WindowsMode: windowsModeWSL2}, acquired: true},
+		{name: "fresh Windows input requires witness", target: SSHTarget{TargetOS: targetWindows, WindowsMode: windowsModeNormal}, acquired: true, wantOwner: true},
 		{name: "fresh keep", acquired: true, mayRetain: true, wantOwner: true},
 		{name: "fresh keep-on-failure", acquired: true, mayRetain: true, wantOwner: true},
 		{name: "reused retained lease", acquired: false, wantOwner: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := shouldAcquireWorkspaceOwner(tt.acquired, tt.mayRetain, exclusive); got != tt.wantOwner {
+			if got := shouldAcquireWorkspaceOwner(tt.target, tt.acquired, tt.mayRetain, exclusive); got != tt.wantOwner {
 				t.Fatalf("shouldAcquireWorkspaceOwner()=%t, want %t", got, tt.wantOwner)
 			}
 		})
@@ -399,7 +403,7 @@ func TestWorkspaceOwnerLifecycleBoundaryMatrix(t *testing.T) {
 		"watch iteration",
 	} {
 		t.Run(lifecycle, func(t *testing.T) {
-			if !shouldAcquireWorkspaceOwner(false, false, nil) {
+			if !shouldAcquireWorkspaceOwner(SSHTarget{}, false, false, nil) {
 				t.Fatalf("reused %s path bypassed workspace ownership", lifecycle)
 			}
 		})
@@ -407,7 +411,7 @@ func TestWorkspaceOwnerLifecycleBoundaryMatrix(t *testing.T) {
 }
 
 func TestWorkspaceOwnerSerializesStaticRunAndStandaloneActionsHydration(t *testing.T) {
-	if !shouldAcquireWorkspaceOwner(true, false, testStaticSSHBackend{}) {
+	if !shouldAcquireWorkspaceOwner(SSHTarget{}, true, false, testStaticSSHBackend{}) {
 		t.Fatal("static SSH acquisition bypassed workspace ownership")
 	}
 	remote := newFakeWorkspaceOwnerRemote()
@@ -497,7 +501,7 @@ func TestWorkspaceOwnerProtocolGeneration(t *testing.T) {
 	}
 	windowsInputSize := int64(len("input"))
 	windowsInputWitness := remoteWorkspaceOwnerWindowsWitness(key, token, "Write-Output ok", &windowsInputSize)
-	for _, want := range []string{"$remaining = [Int64]5", "$stdin.Read($buffer, 0, $readSize)", "-RedirectStandardInput $inputPath", "[IO.FileShare]::None"} {
+	for _, want := range []string{"$remaining = [Int64]5", "$stdin.ReadAsync($buffer, 0, $readSize).GetAwaiter().GetResult()", "-RedirectStandardInput $inputPath", "[IO.FileShare]::None"} {
 		if !strings.Contains(windowsInputWitness, want) {
 			t.Fatalf("Windows input witness missing %q:\n%s", want, windowsInputWitness)
 		}
@@ -513,6 +517,7 @@ func TestWorkspaceOwnerNativeWindowsCommandLengthBaseline(t *testing.T) {
 	commands := map[string]string{
 		"owner acquire":       acquire,
 		"large witness stage": remoteWorkspaceOwnerWindowsStageWitnessCommand(key, token, name, 20_000),
+		"maximum frame size":  remoteWorkspaceOwnerWindowsStageWitnessCommand(key, token, name, 1<<63-4),
 		"large witness run":   remoteWorkspaceOwnerWindowsRunWitnessCommand(name),
 		"witness cleanup":     remoteWorkspaceOwnerWindowsCleanupWitnessCommand(name),
 		"background witness":  remoteWorkspaceOwnerWindowsStartBackgroundWitnessCommand(name),
@@ -1340,7 +1345,7 @@ func TestWorkspaceOwnerNativeWindowsWitnessStagesRawScriptAndPreservesInput(t *t
 
 	stageCommand, stagedScript := readWorkspaceOwnerSSHCall(t, dir, 1)
 	stage := decodePowerShellCommand(t, stageCommand)
-	for _, want := range []string{"[IO.FileMode]::CreateNew", "[IO.FileShare]::None", "$stdin.Read($buffer, 0, $readSize)", "staged workspace witness length is ambiguous", owner.key, owner.token} {
+	for _, want := range []string{"[IO.FileMode]::CreateNew", "[IO.FileShare]::None", "$stdin.ReadAsync($buffer, 0, $readSize).GetAwaiter().GetResult()", "staged workspace witness length is ambiguous", owner.key, owner.token} {
 		if !strings.Contains(stage, want) {
 			t.Fatalf("stage command missing %q", want)
 		}

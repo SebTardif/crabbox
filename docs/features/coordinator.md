@@ -387,10 +387,12 @@ fallback, persists the record, and returns 201 `{lease}`. The CLI then starts a
 heartbeat goroutine and a lease watch.
 
 **Heartbeat.** `POST /v1/leases/{id}/heartbeat` bumps `lastTouchedAt`,
-recomputes `expiresAt`, clears cleanup metadata, and reschedules the alarm. It
+recomputes `expiresAt`, clears cleanup metadata, and arms the alarm no later
+than the lease's next deadline, preserving an already-earlier wakeup. It
 updates the idle timeout **only** when the request explicitly sends a positive
 `idleTimeoutSeconds` (clamped to `86400`); telemetry samples may ride along in
-the same body.
+the same body. HTTP and control-websocket heartbeats use the same alarm arming;
+an explicitly shortened idle timeout advances the wakeup when necessary.
 
 **Cancel create.** If the caller cancels an ordinary create, the CLI sends
 `POST /v1/leases/{requested-id}/cancel-create` with the exact create-attempt
@@ -400,8 +402,19 @@ canonical lease exists, its released state and durable cleanup claim are written
 under the same state lock before provider deletion, so ordinary maintenance can
 resume cleanup after a restart. It releases a reserved, provisioning, or
 retained canonical lease only when its private token, owner/org, and retained
-generation match; otherwise it fails closed. Fixed-ID `PUT` creates remain
-replay-owned and never use cancellation cleanup.
+generation match; otherwise it fails closed.
+
+Fixed-ID `PUT` creates record an owner/org/provider-bound intent before
+asynchronous preparation or capacity checks. They remain replay-owned, without
+a caller-supplied cancellation token. `POST /v1/leases/{id}/release` also
+cancels an admitted fixed intent that has not allocated a machine, including
+one rejected by a quota check. The cancellation survives coordinator restart
+and prevents a delayed or repeated create from allocating. Admission alone
+does not create a lease row or reserve usage. Unknown IDs still return 404;
+missing records from older coordinators do not prove cancellation or cleanup.
+Fixed admissions use version-2 attempt records: an older coordinator refuses
+to reuse these IDs, but only the upgraded coordinator can confirm cancellation
+before a lease row exists.
 
 **Release.** `POST /v1/leases/{id}/release` (body `{delete?}`, defaulting to
 `!keep`) deletes the cloud server when the lease is still active and sets state
@@ -418,6 +431,20 @@ claim and credentials for retry. Acquisition rollback queues release without
 waiting, as does automatic post-run release, so asynchronous provider cleanup
 does not delay an otherwise completed run. Isolated local lease credentials are
 removed only after final deletion is observed; retained releases preserve them.
+
+Ordinary heartbeat and release acknowledgements arm alarms under the lifecycle
+mutex without scanning global workspace or lease collections for scheduling.
+Release retains durable cleanup intent and requests immediate maintenance;
+retries preserve that wakeup, including after coordinator reconstruction.
+An already-due stored alarm time is rearmed at the earlier of that time and the
+requested deadline: a consumed runtime job can leave its timestamp behind.
+An earlier future alarm is preserved without another scheduling write.
+Alarm storage errors still fail the request and do not certify cleanup success.
+The existing full scheduler shares the lifecycle mutex with this arming, so a
+scan cannot race an acknowledgement's earlier wakeup. Full maintenance scans,
+slug resolution, provider access refresh, and provider ingress locking retain
+their existing behavior; their work and other shared-queue stalls are not
+bounded by this acknowledgement path.
 
 **Expiry and cleanup.** A DO alarm and the cron both run maintenance:
 `expireLeases` deletes cloud servers for active leases past `expiresAt`
@@ -451,6 +478,18 @@ heartbeats. A run keeps its initiating actor in `owner`/`org` plus every backing
 lease identity used by replacement flows. Each backing lease owner can read and
 subscribe for audit purposes, while only the actor or an admin can append
 events or telemetry and finish the run.
+
+Terminal finish atomically persists the run, signed receipt when supplied, log
+pointer, and terminal event before notifying control subscribers. Attachment
+read or serialization failures retire the affected socket and allow delivery
+to other authorized subscribers without failing the durable acknowledgement.
+Late close, error, and queued message callbacks for a retired notification
+socket are ignored without rereading its attachment; a replacement socket with
+the same client ID is unaffected.
+Subscription relevance is checked before asynchronous grant revalidation;
+both run access and a current grant are still required before sending. Receipt
+validation, storage, and grant-validation errors remain errors. Identical finish
+replays are idempotent; conflicting terminal evidence still returns `409`.
 
 ## CLI responsibilities
 

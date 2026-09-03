@@ -1597,7 +1597,7 @@ func routeConfiguredProvider(cfg *Config) error {
 }
 
 func runtimeForApp(a App) Runtime {
-	return Runtime{Stdout: a.Stdout, Stderr: a.Stderr, Clock: realClock{}, Exec: execCommandRunner{}, HTTP: &http.Client{Timeout: 60 * time.Second}}
+	return Runtime{Stdout: a.Stdout, Stderr: a.Stderr, Clock: realClock{}, Exec: execCommandRunner{}}
 }
 
 const (
