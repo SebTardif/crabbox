@@ -49,8 +49,21 @@ func (m rootVolumeManifest) validate() error {
 	return nil
 }
 
+// An ambiguous create can record the volume contract before Scaleway returns
+// a volume id. There is nothing to delete by id, so server cleanup must not
+// treat that missing id as a reason to keep the instance.
+func (m rootVolumeManifest) allowsCleanupWithoutVolumeID() bool {
+	return m.id == "" && m.contract == rootVolumeContract && !m.pending
+}
+
 func validateRootVolumeIdentity(claim core.LeaseClaim, server core.Server, cleanup bool) error {
 	want, got := rootVolumeFromLabels(claim.Labels), rootVolumeFromLabels(server.Labels)
+	if cleanup && want.allowsCleanupWithoutVolumeID() {
+		if got.id != "" || (got.contract != "" && got.contract != rootVolumeContract) || got.pending {
+			return core.Exit(2, "Scaleway root-volume allocation identity differs from the local claim; refusing operation")
+		}
+		return nil
+	}
 	if err := want.validate(); err != nil {
 		return err
 	}
@@ -87,6 +100,9 @@ func (b *Backend) validateVolumeMutation(server core.Server) (core.LeaseClaim, b
 }
 
 func inspectRootVolume(ctx context.Context, client Client, manifest rootVolumeManifest, serverID string, detached bool) (*instance.Volume, error) {
+	if manifest.allowsCleanupWithoutVolumeID() {
+		return nil, nil
+	}
 	if err := manifest.validate(); err != nil {
 		return nil, err
 	}

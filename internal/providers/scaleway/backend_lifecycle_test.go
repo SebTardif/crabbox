@@ -1405,6 +1405,33 @@ func TestScalewayReleaseRetainsIdentitylessRecoveryClaim(t *testing.T) {
 	}
 }
 
+func TestScalewayAmbiguousCreateWithoutVolumeIDCanBeCleanedUp(t *testing.T) {
+	backend, fake := newTestBackend(t)
+	cfg := backend.cfgForRun()
+	leaseID := "cbx_474747474747"
+	slug := "ambiguous-volume"
+	labels := core.DirectLeaseLabels(cfg, leaseID, slug, providerName, "", false, backend.clockNow())
+	labels["recovery"] = "ambiguous-create"
+	labels["scaleway_project"] = "project-1"
+	labels["scaleway_zone"] = "fr-par-1"
+	labels["scaleway_ssh_key_id"] = "key-ambiguous-volume"
+	labels[volumeContractLabel] = rootVolumeContract
+	claimServer := core.Server{Provider: providerName, Name: slug, Labels: labels}
+	if err := core.ClaimLeaseTargetForConfig(leaseID, slug, cfg, claimServer, core.SSHTarget{}, cfg.IdleTimeout); err != nil {
+		t.Fatal(err)
+	}
+	liveLabels := maps.Clone(labels)
+	delete(liveLabels, "recovery")
+	fake.server = testServer("srv-ambiguous-volume", core.LeaseProviderName(leaseID, slug), tagsFromLabels(liveLabels), "203.0.113.27")
+
+	if err := backend.deleteServer(context.Background(), fake, backend.serverFromScaleway(fake.server)); err != nil {
+		t.Fatalf("deleteServer err=%v", err)
+	}
+	if !fake.deletedServer || fake.deletedServerID != "srv-ambiguous-volume" {
+		t.Fatalf("server without a volume id was not deleted: deleted=%t id=%q", fake.deletedServer, fake.deletedServerID)
+	}
+}
+
 func TestScalewayAmbiguousCreateBindsUniqueServerBeforeCleanup(t *testing.T) {
 	backend, fake := newTestBackend(t)
 	cfg := backend.cfgForRun()
